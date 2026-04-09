@@ -6,7 +6,7 @@ os.environ['SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK'] = '1'
 import torch
 import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 import pandas as pd
 import json
 from typing import Dict, List, Tuple, Callable, Any, Optional
@@ -23,11 +23,30 @@ from r2r.evaluate.eval_utils import lcb_codegeneration_prompt_fn
 import time
 import sglang as sgl
 from sglang.srt.hf_transformers_utils import get_tokenizer
+import sglang.srt.model_executor.forward_batch_info as fbi
 from r2r.evaluate.eval_utils import select_by_category, generate_cot_prompt, preprocess
 import multiprocessing as mp
 import warnings
 from r2r.utils.config import TOKEN_TYPE
 import r2r.models.sglang_patch.sgl_engine_patcher
+
+# --- MONKEY PATCH FOR QWEN2.5-VL TEXT-ONLY INPUTS ---
+# Fixes a crash in SGLang when processing text-only inputs with VL models.
+# VL models expect multimodal data for mROPE positional embeddings. If none is provided,
+# SGLang leaves `multimodal_inputs` as None, causing a TypeError during mROPE calculation.
+# This patch safely injects an empty list ([None]) to satisfy the VL architecture.
+_orig_compute_mrope = fbi.ForwardBatch._compute_mrope_positions
+
+
+def _patched_compute_mrope(self, model_runner, batch):
+    if getattr(batch, 'multimodal_inputs', None) is None:
+        num_reqs = len(batch.reqs) if hasattr(batch, 'reqs') else 1
+        batch.multimodal_inputs = [None] * num_reqs
+    return _orig_compute_mrope(self, model_runner, batch)
+
+
+fbi.ForwardBatch._compute_mrope_positions = _patched_compute_mrope
+# ----------------------------------------------------
 
 # set numpy random seed
 np.random.seed(42)
@@ -88,6 +107,8 @@ def parse_args():
                       help=f'Dataset to use: {", ".join(DATASET_CONFIGS.keys())}')
     parser.add_argument('--dataset_path', type=str, default=None,
                       help='Override the default dataset path if needed')
+    parser.add_argument('--dataset_local_path', type=str, default=None,
+                      help='Local filesystem path for the evaluation dataset (file, directory, or Hugging Face save_to_disk output)')
     parser.add_argument('--dataset_config', type=str, default=None,
                       help='Dataset configuration name (e.g., "gpqa_diamond" for GPQA)')
     
@@ -100,10 +121,10 @@ def parse_args():
                         help='Fraction of GPU memory to allocate for judging')
     # Path configuration
     parser.add_argument('--output_dir', type=str, default=None,
-                      help='Directory to save results (defaults to output/{dataset}_eval)')
+                      help='Directory to save results (default: output/eval/{dataset}/{dataset}_{timestamp})')
     
     # Generation configuration
-    parser.add_argument('--max_new_tokens', type=int, default=32768,
+    parser.add_argument('--max_new_tokens', type=int, default=16384,
                       help='Maximum number of new tokens to generate')
     parser.add_argument('--temperature', type=float, default=0.0,
                       help='Temperature for the model')
@@ -187,14 +208,33 @@ def parse_args():
     # Get dataset config
     dataset_config = DATASET_CONFIGS[args.dataset]
     
-    # Set default output directory based on dataset if not provided
+    # Set default output directory based on dataset if not provided.
+    # This creates run folders like output/eval/<dataset>/<dataset>_<timestamp>_<model_setting>.
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.output_dir = f"output/eval/hf_dataset_sglang/{args.dataset}_eval_{timestamp}"
+        model_setting = None
+        if args.config_path:
+            config_basename = os.path.basename(args.config_path.rstrip(os.sep))
+            if config_basename.lower() == "config.yaml":
+                parent_dir = os.path.basename(os.path.dirname(args.config_path.rstrip(os.sep)))
+                model_setting = parent_dir or None
+            else:
+                model_setting, _ = os.path.splitext(config_basename)
+                if not model_setting:
+                    model_setting = None
+
+        run_folder_name = f"{args.dataset}_{timestamp}"
+        if model_setting:
+            run_folder_name = f"{run_folder_name}_{model_setting}"
+        args.output_dir = os.path.join("output", "eval", args.dataset, run_folder_name)
     
     # Use dataset_path from config if not overridden
     if args.dataset_path is None:
         args.dataset_path = dataset_config["path"]
+
+    # If a local path is provided, it takes precedence over config/default path
+    if args.dataset_local_path:
+        args.dataset_path = args.dataset_local_path
     
     # Use dataset_config from config if not overridden and it exists
     if args.dataset_config is None and "dataset_config" in dataset_config:
@@ -327,6 +367,22 @@ def process_with_model(
         router_path = router_config.get("router_path")
         if router_path:
             print(f"Using router path from config: {router_path}")
+            router_path = os.path.abspath(router_path)
+            print(f"Resolved router path: {router_path}")
+            if os.path.isdir(router_path):
+                raise ValueError(
+                    "router_path points to a directory, but a .pt file is required: "
+                    f"{router_path}"
+                )
+            if not os.path.isfile(router_path):
+                raise FileNotFoundError(f"router_path does not exist: {router_path}")
+            if not router_path.endswith(".pt"):
+                raise ValueError(f"router_path must point to a .pt file: {router_path}")
+        else:
+            raise ValueError(
+                "router.router_path is missing in --config-path file. "
+                "Please set it to an absolute .pt file path."
+            )
         
         if switching_strategy == 'rolling':
             strategy_kwargs.update({
@@ -351,9 +407,11 @@ def process_with_model(
             threshold = router_config.get("threshold")
             if threshold is None:
                 threshold = args.threshold
+            print(f"Using threshold for neural router: {threshold}")
             
             if threshold is not None:
                 strategy_kwargs["threshold"] = threshold
+                print(f"The actual threshold used for neural router is: {strategy_kwargs['threshold']}")
         elif switching_strategy == 'neural_rolling':
             strategy_kwargs.update({
                 'model_path': router_path,
@@ -492,7 +550,7 @@ def evaluate_problem(
             
         # Prepare messages using chat template
         messages_list = [
-            [{"role": "user", "content": item['FormattedProblem']}]
+            [{"role": "user", "content": item.get('FormattedProblem', item.get('Problem', ''))}]
             for item in batch
         ]
 
@@ -559,13 +617,16 @@ def evaluate_problem(
             
             # Extract answer using the appropriate extractor
             predicted_answer, has_answer = answer_extractor(final_answer)
+            ground_truth, has_ground_truth = answer_extractor(item['Answer'])
+            if has_ground_truth == False:
+                print(f"Warning: No valid ground truth answer extracted for problem ID {item['ID']}. Original answer: {item['Answer']}")
+                ground_truth = item['Answer']  # Fall back to original answer if extraction fails
             
             # Check correctness
             is_correct = False
-            print("Has extracted answer:", has_answer)
             if has_answer:
-                print(f"Predicted answer: {predicted_answer}, Correct answer: {item['Answer']}")
-                is_correct = check_answer_correctness(predicted_answer, item['Answer'], answer_type)
+                print(f"Predicted answer: {predicted_answer}, Correct answer: {ground_truth}")
+                is_correct = check_answer_correctness(predicted_answer, ground_truth, answer_type)
             
             # Calculate token usage
             input_tokens = len(tokenizer.encode(prompts[j]))
@@ -643,8 +704,8 @@ def evaluate_problem(
             
             temp_output_path = os.path.join(temp_dir, f"{problem_id}_run_{run_number}.txt")
             temp_output_csv_path = os.path.join(temp_csv_dir, f"{problem_id}_run_{run_number}.csv")
-            write_to_file(temp_output_path, result)
-            write_to_csv(temp_output_csv_path, result)
+            # write_to_file(temp_output_path, result)
+            write_to_csv(temp_output_csv_path, result, prompts[j])
     
     if use_hybrid:
         generator.shutdown()
@@ -687,7 +748,7 @@ def save_results(results: List[Dict], model_name: str, gpu_id: int, thread_id: i
             problem_id_counts[problem_id] = 1
             output_path = f"{outputs_dir}/{problem_id}_run_1.txt"
             
-        write_to_file(output_path, result)
+        # write_to_file(output_path, result)
     
     # Save metadata to JSON
     json_path = f"{output_dir}/metadata_{model_name}_gpu{gpu_id}_thread{thread_id}_{timestamp}.json"
@@ -825,6 +886,21 @@ def preprocess_dataset(dataset, dataset_config: Dict, save_result_dir: str) -> L
     - Options: for multiple choice, a dictionary of options
     """
     processed_data = []
+
+    def get_nested_value(record: Dict[str, Any], field_path: str) -> Any:
+        """Resolve nested dict fields using dot notation like 'a.b.c'."""
+        if not isinstance(field_path, str) or not field_path:
+            return None
+        if "." not in field_path:
+            return record.get(field_path)
+
+        value: Any = record
+        for key in field_path.split("."):
+            if isinstance(value, dict) and key in value:
+                value = value[key]
+            else:
+                return None
+        return value
     
     # Get field mapping from config
     id_field = dataset_config.get("id_field", "ID")
@@ -860,55 +936,156 @@ def preprocess_dataset(dataset, dataset_config: Dict, save_result_dir: str) -> L
         dataset = dataset.filter(lambda x: x[filter_config["key"]] in filter_config["value"])
     
     for idx, item in enumerate(dataset):
+        item_id = item[id_field] if id_field in item else idx
+        answer_value = get_nested_value(item, answer_field)
+
         processed_item = {
-            "ID": str(item[id_field]),
+            "ID": str(item_id),
             "Problem": item[question_field],
-            "Answer": item[answer_field]
+            "Answer": answer_value
         }
         
         # For multiple choice questions, process the options
         if dataset_config.get("answer_type") == "multiple_choice":
             options_fields = dataset_config.get("options_fields", [])
-            if len(options_fields) >= 4:  # Need at least 4 options for A, B, C, D
-                # Get the options in a consistent order
-                options = [item[field] for field in options_fields]
-                
-                # Shuffle the options to randomize the correct answer position
-                # Create a mapping from original positions to shuffled positions
-                indices = list(range(len(options)))
-                np.random.shuffle(indices)
-                
-                shuffled_options = [options[i] for i in indices]
-                
-                # Find where the correct answer ended up
-                correct_index = indices.index(0)  # Assuming the first option is the correct one
-                correct_letter = chr(65 + correct_index)  # A, B, C, D...
-                
+            labels_field = dataset_config.get("labels_field")
+
+            options: List[str] = []
+            correct_original_index = 0
+            nested_labels = None
+            correct_index_source = "default_0"
+
+            if isinstance(options_fields, list) and len(options_fields) >= 4:
+                options = [item[field] for field in options_fields if field in item]
+                correct_original_index = 0
+                correct_index_source = "options_fields_list_default_first"
+            elif isinstance(options_fields, str):
+                nested_options = get_nested_value(item, options_fields)
+                nested_labels = get_nested_value(item, labels_field) if labels_field else None
+
+                if isinstance(nested_options, list):
+                    options = nested_options
+                if isinstance(nested_labels, list) and len(nested_labels) == len(options):
+                    positive_indices = [i for i, v in enumerate(nested_labels) if int(v) == 1]
+                    if positive_indices:
+                        correct_original_index = positive_indices[0]
+                        correct_index_source = "labels_one_hot"
+                elif nested_labels is not None:
+                    parsed_index: Optional[int] = None
+
+                    # Support scalar labels like 2 / "2" (index), and letters like "C".
+                    if isinstance(nested_labels, (int, np.integer)):
+                        parsed_index = int(nested_labels)
+                    elif isinstance(nested_labels, str):
+                        label_text = nested_labels.strip()
+                        if label_text.isdigit() or (label_text.startswith("-") and label_text[1:].isdigit()):
+                            parsed_index = int(label_text)
+                        elif len(label_text) == 1 and label_text.upper() in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                            parsed_index = ord(label_text.upper()) - ord("A")
+
+                    if parsed_index is not None and len(options) > 0:
+                        if 0 <= parsed_index < len(options):
+                            correct_original_index = parsed_index
+                            correct_index_source = "labels_scalar_zero_based"
+                        elif 1 <= parsed_index <= len(options):
+                            correct_original_index = parsed_index - 1
+                            correct_index_source = "labels_scalar_one_based"
+                        else:
+                            print(
+                                f"Warning: Scalar label index out of range for item {processed_item['ID']} "
+                                f"(label={nested_labels}, parsed_index={parsed_index}, num_options={len(options)}). "
+                                "Falling back to 0."
+                            )
+
+            if len(options) >= 2:
+                if correct_original_index < 0 or correct_original_index >= len(options):
+                    print(
+                        f"Warning: Invalid correct option index for item {processed_item['ID']} "
+                        f"(index={correct_original_index}, num_options={len(options)}). Falling back to 0."
+                    )
+                    correct_original_index = 0
+
+                if len(options) > 4:
+                    # Keep one correct option and sample 3 incorrect options so answer stays in A-D.
+                    incorrect_indices = [i for i in range(len(options)) if i != correct_original_index]
+                    np.random.shuffle(incorrect_indices)
+                    selected_indices = [correct_original_index] + incorrect_indices[:3]
+                else:
+                    selected_indices = list(range(len(options)))
+
+                np.random.shuffle(selected_indices)
+                shuffled_options = [options[i] for i in selected_indices]
+
+                correct_index = selected_indices.index(correct_original_index)
+                correct_letter = chr(65 + correct_index)
+
+                show_logging = False
+                if show_logging:
+                    # Detailed option-variation logging for monitoring option/ground-truth mapping.
+                    print(f"\n[MC-TRACE] item_id={processed_item['ID']}")
+                    print(
+                        f"[MC-TRACE] original_data: answer_field={answer_field}, "
+                        f"original_answer={answer_value}, question={processed_item['Problem']}"
+                    )
+                    if isinstance(options_fields, list):
+                        print(f"[MC-TRACE] options_fields(list)={options_fields}")
+                    else:
+                        print(
+                            f"[MC-TRACE] options_fields(path)={options_fields}, "
+                            f"labels_field(path)={labels_field}, labels={nested_labels}"
+                        )
+                    print(f"[MC-TRACE] original_options_with_index={list(enumerate(options))}")
+                    print(f"[MC-TRACE] selected_indices_after_sampling_and_shuffle={selected_indices}")
+                    print(f"[MC-TRACE] shuffled_options_with_index={list(enumerate(shuffled_options))}")
+                    print(
+                        f"[MC-TRACE] ground_truth_mapping: "
+                        f"original_correct_index={correct_original_index}, "
+                        f"correct_index_source={correct_index_source}, "
+                        f"shuffled_correct_index={correct_index}, "
+                        f"correct_letter={correct_letter}, "
+                        f"correct_option_text={options[correct_original_index]}"
+                    )
+
+                option_letters = ["A", "B", "C", "D"]
                 processed_item["Options"] = {
-                    "A": shuffled_options[0],
-                    "B": shuffled_options[1],
-                    "C": shuffled_options[2],
-                    "D": shuffled_options[3]
+                    option_letters[idx]: option_text
+                    for idx, option_text in enumerate(shuffled_options)
                 }
                 processed_item["Answer"] = correct_letter
-                
-                # Format the problem with options
-                processed_item["FormattedProblem"] = QUERY_TEMPLATE_MULTICHOICE.format(
-                    Question=processed_item["Problem"],
-                    A=processed_item["Options"]["A"],
-                    B=processed_item["Options"]["B"],
-                    C=processed_item["Options"]["C"],
-                    D=processed_item["Options"]["D"]
-                )
+
+                if len(shuffled_options) == 4:
+                    processed_item["FormattedProblem"] = QUERY_TEMPLATE_MULTICHOICE.format(
+                        Question=processed_item["Problem"],
+                        A=processed_item["Options"]["A"],
+                        B=processed_item["Options"]["B"],
+                        C=processed_item["Options"]["C"],
+                        D=processed_item["Options"]["D"]
+                    )
+                else:
+                    available_letters = "".join(processed_item["Options"].keys())
+                    options_block = "\n".join(
+                        f"{letter}) {option_text}"
+                        for letter, option_text in processed_item["Options"].items()
+                    )
+                    processed_item["FormattedProblem"] = (
+                        "Answer the following multiple choice question. "
+                        "The last line of your response should be of the following format: "
+                        f"'Answer: $LETTER' (without quotes) where LETTER is one of {available_letters}. "
+                        "Think step by step before answering.\n\n"
+                        f"{processed_item['Problem']}\n\n"
+                        f"{options_block}"
+                    )
             else:
-                print(f"Warning: Not enough option fields for multiple choice item {processed_item['ID']}")
+                print(f"Warning: Not enough options for multiple choice item {processed_item['ID']}")
+                processed_item["FormattedProblem"] = processed_item["Problem"]
                 
         elif dataset_config.get("answer_type") == "mmlu-multiple-choice":
             k = 0
             prompt = generate_cot_prompt(full_val_df, item, k)
             processed_item["FormattedProblem"] = prompt
             processed_item["Answer"] = item["answer"]
-            processed_item["Category"] = item["category"]
+            # processed_item["Category"] = item["category"]
+            processed_item["Category"] = item["subject"] if "subject" in item else item["Category"]
         
         elif dataset_config.get("answer_type") == "livecodebench":
             processed_item['__index'] = idx
@@ -932,6 +1109,81 @@ def preprocess_dataset(dataset, dataset_config: Dict, save_result_dir: str) -> L
         processed_data.append(processed_item)
         
     return processed_data
+
+def load_dataset_with_local_support(dataset_path: str, dataset_config: Optional[str] = None):
+    """Load dataset from either Hugging Face hub path or local filesystem path.
+
+    Supported local inputs:
+    - `datasets.save_to_disk` directory
+    - Single file: json/jsonl/csv/parquet/txt
+    - Directory containing split files (train/validation/test)
+    """
+    if not dataset_path:
+        raise ValueError("dataset_path must not be empty")
+
+    if not os.path.exists(dataset_path):
+        # Not a local path: fall back to Hugging Face path behavior.
+        if dataset_config:
+            return load_dataset(dataset_path, dataset_config, trust_remote_code=True)
+        return load_dataset(dataset_path, trust_remote_code=True)
+
+    if os.path.isdir(dataset_path):
+        # Handle datasets saved with `save_to_disk`.
+        dataset_info = os.path.join(dataset_path, "dataset_info.json")
+        state_file = os.path.join(dataset_path, "state.json")
+        if os.path.exists(dataset_info) and os.path.exists(state_file):
+            return load_from_disk(dataset_path)
+
+        # Handle common split file patterns in a local directory.
+        patterns = {
+            "train": ["train.json", "train.jsonl", "train.csv", "train.parquet", "train.txt"],
+            "validation": ["validation.json", "validation.jsonl", "validation.csv", "validation.parquet", "validation.txt", "val.json", "val.jsonl", "val.csv", "val.parquet", "val.txt"],
+            "test": ["test.json", "test.jsonl", "test.csv", "test.parquet", "test.txt"],
+        }
+        data_files = {}
+        for split, filenames in patterns.items():
+            for filename in filenames:
+                full_path = os.path.join(dataset_path, filename)
+                if os.path.exists(full_path):
+                    data_files[split] = full_path
+                    break
+
+        if data_files:
+            # Infer loader type from first matched file extension.
+            first_file = next(iter(data_files.values()))
+            ext = os.path.splitext(first_file)[1].lower()
+            if ext in [".json", ".jsonl"]:
+                loader_name = "json"
+            elif ext == ".csv":
+                loader_name = "csv"
+            elif ext == ".parquet":
+                loader_name = "parquet"
+            elif ext == ".txt":
+                loader_name = "text"
+            else:
+                loader_name = "json"
+            return load_dataset(loader_name, data_files=data_files)
+
+        raise ValueError(
+            f"Unsupported local dataset directory: {dataset_path}. "
+            "Expected a `save_to_disk` directory or split files like train/test in json/jsonl/csv/parquet/txt format."
+        )
+
+    # Single local file path
+    ext = os.path.splitext(dataset_path)[1].lower()
+    if ext in [".json", ".jsonl"]:
+        return load_dataset("json", data_files={"train": dataset_path})
+    if ext == ".csv":
+        return load_dataset("csv", data_files={"train": dataset_path})
+    if ext == ".parquet":
+        return load_dataset("parquet", data_files={"train": dataset_path})
+    if ext == ".txt":
+        return load_dataset("text", data_files={"train": dataset_path})
+
+    raise ValueError(
+        f"Unsupported local dataset file format: {dataset_path}. "
+        "Supported extensions: .json, .jsonl, .csv, .parquet, .txt"
+    )
 
 def extract_results_from_temp_csvs(output_dir: str,use_job_dirs: bool = True):
     """Extract and combine results from all temp CSV files in job directories.
@@ -991,7 +1243,7 @@ def extract_results_from_temp_csvs(output_dir: str,use_job_dirs: bool = True):
     print(f"Combined results saved to {output_path}")
     print(f"Total number of problems: {len(combined_df)}")
 
-def print_evaluation_metrics(args: argparse.Namespace, output_dir: str, all_problems: List[Dict], completed_problems: set):
+def print_evaluation_metrics(args: argparse.Namespace, output_dir: str, all_problems: List[Dict], completed_problems: set) -> Dict[str, float]:
     """Print comprehensive evaluation metrics for all dataset types.
     
     Args:
@@ -1000,6 +1252,8 @@ def print_evaluation_metrics(args: argparse.Namespace, output_dir: str, all_prob
         all_problems: List of all problems in the dataset
         completed_problems: Set of completed problem IDs
     """
+    metrics: Dict[str, float] = {}
+
     print("\n" + "="*80)
     print("EVALUATION METRICS SUMMARY")
     print("="*80)
@@ -1008,6 +1262,7 @@ def print_evaluation_metrics(args: argparse.Namespace, output_dir: str, all_prob
     print(f"Dataset: {args.dataset}")
     print(f"Model: {args.model_path}")
     print(f"Total problems in dataset: {len(all_problems)}")
+    metrics["total_problems"] = float(len(all_problems))
     
     # Load and analyze combined results if available
     combined_results_path = os.path.join(output_dir, "combined_results.csv")
@@ -1022,10 +1277,12 @@ def print_evaluation_metrics(args: argparse.Namespace, output_dir: str, all_prob
             if 'has_extracted_answer' in df.columns:
                 extraction_rate = df['has_extracted_answer'].mean() * 100
                 print(f"Answer extraction rate: {extraction_rate:.2f}%")
+                metrics["answer_extraction_rate_pct"] = float(extraction_rate)
             
             if 'is_correct' in df.columns:
                 overall_accuracy = df['is_correct'].mean() * 100
                 print(f"Overall accuracy: {overall_accuracy:.2f}%")
+                metrics["overall_accuracy_pct"] = float(overall_accuracy)
             
             # Pass@1 metrics (if repeat_input_num > 1)
             if args.repeat_input_num > 1 and 'is_correct' in df.columns:
@@ -1038,6 +1295,7 @@ def print_evaluation_metrics(args: argparse.Namespace, output_dir: str, all_prob
                 pass_at_1_rate = (overall_correct_count / total_attempts) * 100
                 
                 print(f"Pass@1: {pass_at_1_rate:.2f}% ({overall_correct_count}/{total_attempts})")
+                metrics["pass_at_1_pct"] = float(pass_at_1_rate)
                 
                 # Additional statistics for repeated attempts
                 grouped = df.groupby('problem_id')['is_correct']
@@ -1046,13 +1304,17 @@ def print_evaluation_metrics(args: argparse.Namespace, output_dir: str, all_prob
                 avg_attempts = attempts_per_problem.mean()
                 print(f"Average attempts per problem: {avg_attempts:.1f}")
                 print(f"Total problems: {total_problems}")
+                metrics["avg_attempts_per_problem"] = float(avg_attempts)
                 
                 # Show distribution of correct attempts per problem
                 correct_per_problem = grouped.sum()
                 print(f"Problems with 0 correct: {(correct_per_problem == 0).sum()}")
                 print(f"Problems with all correct: {(correct_per_problem == args.repeat_input_num).sum()}")
+                metrics["problems_with_0_correct"] = float((correct_per_problem == 0).sum())
+                metrics["problems_with_all_correct"] = float((correct_per_problem == args.repeat_input_num).sum())
                 if args.repeat_input_num > 2:
                     print(f"Problems with partial correct: {((correct_per_problem > 0) & (correct_per_problem < args.repeat_input_num)).sum()}")
+                    metrics["problems_with_partial_correct"] = float(((correct_per_problem > 0) & (correct_per_problem < args.repeat_input_num)).sum())
             
             # Token usage metrics
             print("\n TOKEN USAGE METRICS:")
@@ -1060,16 +1322,20 @@ def print_evaluation_metrics(args: argparse.Namespace, output_dir: str, all_prob
             if 'input_tokens' in df.columns:
                 avg_input_tokens = df['input_tokens'].mean()
                 print(f"Average input tokens: {avg_input_tokens:.0f}")
+                metrics["avg_input_tokens_printed"] = float(avg_input_tokens)
             
             if 'output_tokens' in df.columns:
                 avg_output_tokens = df['output_tokens'].mean()
                 print(f"Average output tokens: {avg_output_tokens:.0f}")
+                metrics["avg_output_tokens_printed"] = float(avg_output_tokens)
             
             if 'total_tokens' in df.columns:
                 avg_total_tokens = df['total_tokens'].mean()
                 total_token_sum = df['total_tokens'].sum()
                 print(f"Average total tokens: {avg_total_tokens:.0f}")
                 print(f"Total tokens used: {total_token_sum:,}")
+                metrics["avg_total_tokens_printed"] = float(avg_total_tokens)
+                metrics["total_tokens_used"] = float(total_token_sum)
             
             # Performance metrics
             print("\n PERFORMANCE METRICS:")
@@ -1081,14 +1347,18 @@ def print_evaluation_metrics(args: argparse.Namespace, output_dir: str, all_prob
                 avg_ref_percentage = df['reference_model_percentage'].mean()
                 print(f"Quick model usage: {avg_quick_percentage:.1f}%")
                 print(f"Reference model usage: {avg_ref_percentage:.1f}%")
+                metrics["quick_model_usage_pct"] = float(avg_quick_percentage)
+                metrics["reference_model_usage_pct"] = float(avg_ref_percentage)
                 
                 if 'model_agreement_percentage' in df.columns:
                     avg_agreement = df['model_agreement_percentage'].mean()
                     print(f"Model agreement rate: {avg_agreement:.1f}%")
+                    metrics["model_agreement_rate_pct"] = float(avg_agreement)
                 
                 if 'avg_params_billions' in df.columns:
                     avg_params = df['avg_params_billions'].mean()
                     print(f"Average parameters per token: {avg_params:.2f}B")
+                    metrics["avg_params_billions_printed"] = float(avg_params)
                 
                 # Calculate LLM output token ratio
                 if 'output_tokens' in df.columns and 'input_tokens' in df.columns:
@@ -1106,6 +1376,9 @@ def print_evaluation_metrics(args: argparse.Namespace, output_dir: str, all_prob
                         print(f"LLM output token ratio: {llm_token_ratio:.2f}%")
                         print(f"Total LLM generated tokens: {total_llm_tokens:.0f}")
                         print(f"Total generated tokens: {total_generated_tokens:.0f}")
+                        metrics["llm_output_token_ratio_pct"] = float(llm_token_ratio)
+                        metrics["total_llm_generated_tokens"] = float(total_llm_tokens)
+                        metrics["total_generated_tokens"] = float(total_generated_tokens)
                     else:
                         print("LLM output token ratio: N/A (no generated tokens)")
         
@@ -1117,6 +1390,7 @@ def print_evaluation_metrics(args: argparse.Namespace, output_dir: str, all_prob
     print("\n" + "="*80)
     print("END OF EVALUATION METRICS")
     print("="*80)
+    return metrics
 
 def main():
     args = parse_args()
@@ -1135,11 +1409,9 @@ def main():
     
     # Load and preprocess dataset
     print(f"Loading dataset: {args.dataset} from {args.dataset_path}")
-    if args.dataset_config:
+    if args.dataset_config and not os.path.exists(args.dataset_path):
         print(f"Using dataset config: {args.dataset_config}")
-        dataset = load_dataset(args.dataset_path, args.dataset_config, trust_remote_code=True)
-    else:
-        dataset = load_dataset(args.dataset_path, trust_remote_code=True)
+    dataset = load_dataset_with_local_support(args.dataset_path, args.dataset_config)
     
     print(f"Preprocessing dataset as {args.dataset_config_dict['name']}")
         
@@ -1212,7 +1484,12 @@ def main():
                 stats_df.to_csv(f"{args.output_dir}/stats.csv", index=False)
             
             # Print comprehensive evaluation metrics
-            print_evaluation_metrics(args, args.output_dir, all_problems, completed_problems)
+            printed_metrics = print_evaluation_metrics(args, args.output_dir, all_problems, completed_problems)
+            if printed_metrics:
+                merged_stats = dict(stats) if stats else {}
+                merged_stats.update(printed_metrics)
+                stats_df = pd.DataFrame(list(merged_stats.items()), columns=['metric_name', 'value'])
+                stats_df.to_csv(f"{args.output_dir}/stats.csv", index=False)
             return
         else:
             # Process only a subset of problems for this job
@@ -1301,7 +1578,12 @@ def main():
     # Print comprehensive evaluation metrics at the end
     if not args.split_jobs or args.job_id == -1:
         # Only print metrics for complete runs or when combining results
-        print_evaluation_metrics(args, args.output_dir, all_problems, completed_problems)
+        printed_metrics = print_evaluation_metrics(args, args.output_dir, all_problems, completed_problems)
+        if printed_metrics:
+            merged_stats = dict(stats) if 'stats' in locals() and stats else {}
+            merged_stats.update(printed_metrics)
+            stats_df = pd.DataFrame(list(merged_stats.items()), columns=['metric_name', 'value'])
+            stats_df.to_csv(f"{args.output_dir}/stats.csv", index=False)
 
     # if args.resume:
     #     # run resume_hf_sglang_results.py to get the results
@@ -1350,7 +1632,7 @@ def write_to_file(output_path: str, result: Dict):
             for option_key, option_text in result['options'].items():
                 f.write(f"{option_key}: {option_text}\n")
 
-def write_to_csv(output_path: str, result: Dict):
+def write_to_csv(output_path: str, result: Dict, text_prompt: str = None):
     """Write evaluation results to a CSV file.
     
     Args:
@@ -1369,7 +1651,8 @@ def write_to_csv(output_path: str, result: Dict):
         'total_tokens': result.get('total_tokens', None),
         'run_time': result.get('run_time', None),
         'speed_tokens_per_second': result.get('speed_tokens_per_second', None),
-        'full_output': result['full_output']
+        'full_output': result['full_output'],
+        'text_prompt': text_prompt
     }])
     
     # Add hybrid model statistics if available

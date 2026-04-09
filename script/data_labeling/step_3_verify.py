@@ -33,7 +33,7 @@ import math
 import os
 import json
 
-from r2r.data.generation_controller import DivergePoint
+from r2r.data.generation_controller_original import DivergePoint
 from r2r.data.verify_model import VerifyModel
 from r2r.utils.config import MODEL_DICT
 
@@ -195,8 +195,17 @@ def main():
         max_new_tokens=MODEL_DICT["verify"]["max_new_tokens"],
         mem_fraction_static=args.mem_fraction,
         tp_size=args.tp_size,
-        apply_chat_template_kwargs=getattr(MODEL_DICT["verify"], "apply_chat_template_kwargs", None)
+        apply_chat_template_kwargs=MODEL_DICT["verify"].get("apply_chat_template_kwargs", None)
     )
+
+    # Xuqing's debugging: 
+    print(f"Using verify model: {MODEL_DICT['verify']['model_path']}")
+    print(f"Verify mode: {args.verify_mode}")
+    print(f"Max new tokens: {MODEL_DICT['verify']['max_new_tokens']}")
+    print(f"Mem fraction static: {args.mem_fraction}")
+    print(f"TP size: {args.tp_size}")
+    print(f"apply_chat_template_kwargs: {MODEL_DICT['verify'].get('apply_chat_template_kwargs', None)}")
+    print("====================================================================================\n")
     
     # Process the data in batches, starting from the resume point
     total_rows = len(df)

@@ -564,7 +564,14 @@ class TrainingHistory:
                 "val_pos_rate": val_pos_rate
             })
     
-    def save_checkpoint(self, epoch: int, model: nn.Module, optimizer: optim.Optimizer, val_metrics: dict) -> bool:
+    def save_checkpoint(
+        self,
+        epoch: int,
+        model: nn.Module,
+        optimizer: optim.Optimizer,
+        val_metrics: dict,
+        save_epoch_file: bool = True,
+    ) -> bool:
         """
         Save a checkpoint for the given epoch and log to wandb if enabled.
         Returns True if this is the new best model.
@@ -579,24 +586,29 @@ class TrainingHistory:
             Whether this is the new best model
         """
         checkpoint_path = os.path.join(self.checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pt")
+        best_checkpoint_path = os.path.join(self.checkpoint_dir, "checkpoint_best.pt")
         
         # Save model using the save_model function
         try:
             # Save optimizer state separately since save_model doesn't handle it
             optimizer_state = copy.deepcopy(optimizer.state_dict())
             
-            # Save the model with its configuration and threshold
-            save_model(
-                model=model,
-                output_file=checkpoint_path,
-                threshold=0.5,  # Default threshold
-                epoch=epoch + 1,
-                optimizer_state_dict=optimizer_state,
-                val_metrics=val_metrics
-            )
-            
-            # Store checkpoint info
-            self.checkpoints[epoch + 1] = {"path": checkpoint_path, "val_loss": val_metrics["val_loss"]}
+            # Save periodic/last epoch checkpoint only when requested.
+            epoch_checkpoint_path = None
+            if save_epoch_file:
+                save_model(
+                    model=model,
+                    output_file=checkpoint_path,
+                    threshold=0.5,  # Default threshold
+                    epoch=epoch + 1,
+                    optimizer_state_dict=optimizer_state,
+                    val_metrics=val_metrics
+                )
+                epoch_checkpoint_path = checkpoint_path
+
+            # Store checkpoint info for this epoch.
+            print(f"Checkpoint for epoch {epoch+1} saved at: {epoch_checkpoint_path if epoch_checkpoint_path else 'N/A'} with val_loss: {val_metrics['val_loss']:.4f}")
+            self.checkpoints[epoch + 1] = {"path": epoch_checkpoint_path, "val_loss": val_metrics["val_loss"]}
             
             # Check if this is the best model so far
             is_best = val_metrics["val_loss"] < self.best_val_loss
@@ -604,6 +616,19 @@ class TrainingHistory:
                 self.best_val_loss = val_metrics["val_loss"]
                 self.best_model_state = copy.deepcopy(model.state_dict())
                 self.best_epoch = epoch + 1
+
+                # Always persist best checkpoint regardless of periodic save policy.
+                save_model(
+                    model=model,
+                    output_file=best_checkpoint_path,
+                    threshold=0.5,
+                    epoch=epoch + 1,
+                    optimizer_state_dict=optimizer_state,
+                    val_metrics=val_metrics
+                )
+                # Make best epoch directly loadable from file.
+                print(f"New best model found at epoch {epoch+1} with val_loss: {val_metrics['val_loss']:.4f}. Saved best checkpoint to: {best_checkpoint_path}")
+                self.checkpoints[epoch + 1]["path"] = best_checkpoint_path
                 
                 # Log to wandb if enabled and this is the best model
                 if self.use_wandb:

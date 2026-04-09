@@ -97,11 +97,6 @@ class ModelController:
         else:
             reference_model_path = ""
 
-        # Persist the exact runtime-selected paths for downstream logging/auditing.
-        # The self.small_model_path and self.reference_model_path attributes are only used for logging and tracking.
-        self.small_model_path = small_model_path
-        self.reference_model_path = reference_model_path if reference_model_path else None
-
         # Initialize HuggingFace tokenizer directly
         self.tokenizer = AutoTokenizer.from_pretrained(small_model_path, trust_remote_code=True)
 
@@ -200,9 +195,12 @@ class ModelController:
             self.tokenizer.decode([token_id]) for token_id in self.stop_token_ids
         ]
 
-        # Initialize the DeterministicLogitProcessor.
-        # It must support no-arg reconstruction after sglang serialization.
-        self.deterministic_logit_processor = DeterministicLogitProcessor()
+        # Initialize the DeterministicLogitProcessor
+        self.deterministic_logit_processor = DeterministicLogitProcessor(
+            stop_token_ids=self.stop_token_ids,
+            eos_token_id=self.tokenizer.eos_token_id,
+            num_continuation=-1  # Default value, will be updated when used
+        )
 
     def _is_eos_generated(self, token_id: int) -> bool:
         """Check if generated token is an EOS token"""
@@ -332,12 +330,9 @@ class ModelController:
             # For single continuation, use our custom EOS tokens
             sampling_params["stop_token_ids"] = self.stop_token_ids
         elif num_continuation > 1:
-            # For multiple continuations, pass runtime params via request custom_params.
-            sampling_params["custom_params"] = {
-                "num_continuation": int(num_continuation),
-                "stop_token_ids": [int(x) for x in self.stop_token_ids],
-                "eos_token_id": int(self.tokenizer.eos_token_id),
-            }
+            # For multiple continuations, update the logit processor's num_continuation
+            self.deterministic_logit_processor.num_continuation = num_continuation
+            sampling_params["custom_params"] = {'dummy_for_req': 1}
         # When num_continuation == -1, we don't set stop_token_ids, 
         # letting the model generate until its default EOS or max_new_tokens
 
@@ -412,12 +407,9 @@ class ModelController:
             # For single continuation, use our custom EOS tokens
             sampling_params["stop_token_ids"] = self.stop_token_ids
         elif num_continuation > 1:
-            # For multiple continuations, pass runtime params via request custom_params.
-            sampling_params["custom_params"] = {
-                "num_continuation": int(num_continuation),
-                "stop_token_ids": [int(x) for x in self.stop_token_ids],
-                "eos_token_id": int(self.tokenizer.eos_token_id),
-            }
+            # For multiple continuations, update the logit processor's num_continuation
+            self.deterministic_logit_processor.num_continuation = num_continuation
+            sampling_params["custom_params"] = {'dummy_for_req': 1}
             custom_logit_processor = self.deterministic_logit_processor.to_str()
         # When num_continuation == -1, we don't set stop_token_ids, 
         # letting the model generate until its default EOS or max_new_tokens
@@ -796,14 +788,9 @@ class DeterministicLogitProcessor(CustomLogitProcessor):
     """A dummy logit processor that changes the logits to always
     sample the given token id.
     """
-    def __init__(
-        self,
-        stop_token_ids: Optional[List[int]] = None,
-        eos_token_id: Optional[int] = None,
-        num_continuation: int = -1,
-    ):
+    def __init__(self, stop_token_ids: List[int], eos_token_id: int, num_continuation: int):
         self.eos_token_id = eos_token_id
-        self.stop_token_ids_set = set(stop_token_ids or [])  # O(1) lookup
+        self.stop_token_ids_set = set(stop_token_ids)  # Convert to set for O(1) lookup
         self.num_continuation = num_continuation
 
     def __call__(self, logits: Tensor, custom_param_list: List[Dict]):
@@ -813,11 +800,7 @@ class DeterministicLogitProcessor(CustomLogitProcessor):
             custom_param_list: List[Dict]. The size of the list is the same as the batch size.
                 Each element in the list is a dictionary with the keys and values: input_ids (List[int]), output_ids (List[int]), __req__ (Req); as well as the keys and values specified in the custom_params in sampling_params.
         """
-        runtime_num_cont = int(custom_param_list[0].get("num_continuation", self.num_continuation))
-        runtime_eos_token_id = int(custom_param_list[0].get("eos_token_id", self.eos_token_id))
-        runtime_stop_token_ids_set = set(custom_param_list[0].get("stop_token_ids", list(self.stop_token_ids_set)))
-
-        if runtime_num_cont == -1:
+        if self.num_continuation == -1:
             raise ValueError("num_continuation should not be -1. Ensure it is set before invoking the model's generation function, which requires a valid continuation limit.")
             
         batch_size = logits.shape[0]
@@ -835,16 +818,16 @@ class DeterministicLogitProcessor(CustomLogitProcessor):
                 req.num_continue_count = 0
             
             # Check if this batch item has reached the continuation limit
-            if req.num_continue_count >= runtime_num_cont:
+            if req.num_continue_count >= self.num_continuation:
                 eos_mask[i] = True
             
             # Use set lookup for O(1) time complexity instead of O(n) list search
-            if predicted_tokens[i].item() in runtime_stop_token_ids_set:
+            if predicted_tokens[i].item() in self.stop_token_ids_set:
                 req.num_continue_count += 1
         
         # Apply EOS forcing to all relevant batch items at once using vectorized operations
         if eos_mask.any():
             logits[eos_mask, :] = -float("inf")
-            logits[eos_mask, runtime_eos_token_id] = 1.0
+            logits[eos_mask, self.eos_token_id] = 1.0
        
         return logits 

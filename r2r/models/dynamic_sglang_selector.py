@@ -1,9 +1,11 @@
 import uuid
+import logging
 import torch
 from tqdm import tqdm
-from typing import Optional, Tuple, Union, List
+from typing import Optional, Tuple, Union, List, Dict
 import multiprocessing as mp
 import torch.distributed as dist
+from transformers import AutoTokenizer
 
 from r2r.models.recorder import GenerationRecord, GenerationRecorder
 from r2r.utils.config import (
@@ -21,6 +23,9 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch, ForwardMode, 
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.server_args import PortArgs, ServerArgs
+
+
+logger = logging.getLogger(__name__)
 
 
 class DynamicSimpleSGLangSelector:
@@ -48,8 +53,22 @@ class DynamicSimpleSGLangSelector:
         quick_sglang_kwargs = {**(sglang_kwargs or {})}
         reference_sglang_kwargs = {**(sglang_kwargs or {})}
 
+        self._validate_tokenizer_compatibility()
+
         self.num_gpus = reference_sglang_kwargs.get("tp_size", torch.cuda.device_count())
+        self.total_num_gpus = torch.cuda.device_count()
+        print(f"Total GPUs available: {self.total_num_gpus}")
+        print(f"GPUs allocated for reference model: {self.num_gpus}")
         self.world_size = self.num_gpus
+        self.quick_gpu_id = self.total_num_gpus - 1  # Use the last GPU for quick model
+        if self.quick_gpu_id in range(self.world_size):
+            self.world_size = self.total_num_gpus - 1  # Adjust world size if quick model shares GPU with reference
+        print(f"GPU ID for quick model: {self.quick_gpu_id}")
+        print(f"Effective world size for reference model: {self.world_size}")
+
+        ref_model_name = str(self.model_config.get("reference", {}).get("model_name", "")).lower()
+        ref_model_path = str(self.model_config.get("reference", {}).get("model_path", "")).lower()
+        is_guard_model = "guard" in ref_model_name or "guard" in ref_model_path
 
         # Create dictionary to store recorders
         self.generation_records = {}
@@ -57,7 +76,10 @@ class DynamicSimpleSGLangSelector:
         # Currently only support tp_size=1 for quick model
         quick_sglang_kwargs["tp_size"] = 1
         reference_sglang_kwargs["tp_size"] = self.world_size
-        assert self.num_gpus >= 2, f"Using {self.num_gpus} GPUs for SGLang, expected larger than 2."
+        if not (is_guard_model and self.num_gpus == 1):
+            assert self.num_gpus >= 2, f"Using {self.num_gpus} GPUs for SGLang, expected larger than 2."
+        else:
+            print("Guard reference model detected with tp_size=1; enabling single-GPU reference exemption.")
         print(f"Using {self.num_gpus} GPUs for SGLang, with {self.world_size} for reference and 1 for quick.")
 
         # Initialize SGLang models
@@ -75,7 +97,7 @@ class DynamicSimpleSGLangSelector:
         self.quick_scheduler = Scheduler(
             server_args=self.quick_server_args,
             port_args=quick_port_args,
-            gpu_id=1,
+            gpu_id=self.quick_gpu_id,
             tp_rank=0,
             dp_rank=0,
             moe_ep_rank=0,
@@ -123,6 +145,34 @@ class DynamicSimpleSGLangSelector:
         self.switching_strategy = create_switching_strategy(
             switching_strategy, **self.strategy_kwargs
         )
+
+    def _validate_tokenizer_compatibility(self):
+        quick_model_path = self.model_config["quick"]["model_path"]
+        reference_model_path = self.model_config["reference"]["model_path"]
+
+        quick_tokenizer = AutoTokenizer.from_pretrained(quick_model_path, trust_remote_code=True)
+        reference_tokenizer = AutoTokenizer.from_pretrained(reference_model_path, trust_remote_code=True)
+
+        quick_cls = quick_tokenizer.__class__.__name__
+        ref_cls = reference_tokenizer.__class__.__name__
+
+        quick_vocab_size = getattr(quick_tokenizer, "vocab_size", None)
+        ref_vocab_size = getattr(reference_tokenizer, "vocab_size", None)
+
+        same_tokenizer_space = (
+            quick_cls == ref_cls
+            and quick_vocab_size == ref_vocab_size
+            and quick_tokenizer.eos_token_id == reference_tokenizer.eos_token_id
+        )
+
+        if not same_tokenizer_space:
+            raise ValueError(
+                "Incompatible quick/reference tokenizers for DynamicSimpleSGLangSelector. "
+                f"quick={quick_cls}(vocab={quick_vocab_size}, eos={quick_tokenizer.eos_token_id}), "
+                f"reference={ref_cls}(vocab={ref_vocab_size}, eos={reference_tokenizer.eos_token_id}). "
+                "R2R dynamic switching is token-level and requires both models to share the same tokenizer space. "
+                "Use same-family models (e.g., Qwen+Qwen), or run moderation/classifier models like Llama-Guard in single-model mode."
+            )
     
     def warm_up_reference_model(self):
         # dummy call to warm up the reference model
@@ -172,6 +222,118 @@ class DynamicSimpleSGLangSelector:
         self.quick_scheduler.last_batch = batch
 
     @staticmethod
+    def _collect_pending_request_ids(scheduler: Scheduler) -> List[str]:
+        """Collect request IDs that still exist in scheduler state."""
+        pending_ids: List[str] = []
+        seen = set()
+
+        def _append_req_id(req):
+            rid = getattr(req, "rid", None)
+            if rid is None:
+                return
+            rid = str(rid)
+            if rid not in seen:
+                seen.add(rid)
+                pending_ids.append(rid)
+
+        for req in getattr(scheduler, "waiting_queue", []) or []:
+            _append_req_id(req)
+
+        for attr in ("running_batch", "cur_batch", "last_batch", "batch_not_need"):
+            batch_obj = getattr(scheduler, attr, None)
+            if batch_obj is None:
+                continue
+            for req in getattr(batch_obj, "reqs", []) or []:
+                _append_req_id(req)
+
+        return pending_ids
+
+    @staticmethod
+    def _detach_request_ids_from_scheduler(scheduler: Scheduler, request_ids: List[str]) -> None:
+        """Best-effort removal of request IDs from scheduler queues/batches."""
+        remove_ids = {str(rid) for rid in request_ids}
+        if not remove_ids:
+            return
+
+        waiting_queue = getattr(scheduler, "waiting_queue", None)
+        if isinstance(waiting_queue, list):
+            scheduler.waiting_queue = [
+                req for req in waiting_queue
+                if str(getattr(req, "rid", "")) not in remove_ids
+            ]
+
+        for attr in ("running_batch", "cur_batch", "last_batch", "batch_not_need"):
+            batch_obj = getattr(scheduler, attr, None)
+            if batch_obj is None:
+                continue
+
+            reqs = list(getattr(batch_obj, "reqs", []) or [])
+            if not reqs:
+                continue
+
+            keep_indices = [
+                i for i, req in enumerate(reqs)
+                if str(getattr(req, "rid", "")) not in remove_ids
+            ]
+
+            if len(keep_indices) == len(reqs):
+                continue
+
+            try:
+                batch_obj.filter_batch(keep_indices=keep_indices)
+            except Exception:
+                try:
+                    batch_obj.reqs = [reqs[i] for i in keep_indices]
+                except Exception:
+                    pass
+
+            if not getattr(batch_obj, "reqs", []):
+                if attr in ("cur_batch", "last_batch"):
+                    setattr(scheduler, attr, None)
+                elif attr == "running_batch":
+                    setattr(scheduler, attr, ScheduleBatch(reqs=[], batch_is_full=False))
+                elif attr == "batch_not_need":
+                    setattr(scheduler, attr, None)
+
+    @staticmethod
+    def _snapshot_request_states(scheduler: Scheduler, request_ids: List[str]) -> Dict[str, List[Dict[str, Union[str, bool, int, None]]]]:
+        """Capture where request IDs are and whether they look finished."""
+        id_set = {str(rid) for rid in request_ids}
+        snapshot: Dict[str, List[Dict[str, Union[str, bool, int, None]]]] = {rid: [] for rid in id_set}
+
+        def _finished_value(req):
+            try:
+                finished_fn = getattr(req, "finished", None)
+                if callable(finished_fn):
+                    return bool(finished_fn())
+            except Exception:
+                pass
+            return None
+
+        def _capture(container_name: str, req):
+            rid = str(getattr(req, "rid", ""))
+            if rid not in id_set:
+                return
+            snapshot[rid].append({
+                "container": container_name,
+                "finished": _finished_value(req),
+                "status": str(getattr(req, "status", None)),
+                "output_len": len(getattr(req, "output_ids", []) or []),
+            })
+
+        for req in getattr(scheduler, "waiting_queue", []) or []:
+            _capture("waiting_queue", req)
+
+        for attr in ("running_batch", "cur_batch", "last_batch", "batch_not_need"):
+            batch_obj = getattr(scheduler, attr, None)
+            if batch_obj is None:
+                continue
+            for req in getattr(batch_obj, "reqs", []) or []:
+                _capture(attr, req)
+
+        return snapshot
+
+    @staticmethod
     def reference_model_worker(rank, world_size: int, server_args: ServerArgs, input_queues: List[mp.Queue], output_queue: mp.Queue, ack_queue: mp.Queue):
 
         # initialize the process group
@@ -200,9 +362,20 @@ class DynamicSimpleSGLangSelector:
                 break
             elif isinstance(reqs, str):
                 if reqs == "RESET_CACHE":
-                    # reset the cache
+                    reset_ok = True
+                    try:
+                        reset_ok = bool(scheduler.flush_cache())
+                    except Exception:
+                        reset_ok = False
+                    if not reset_ok:
+                        pending_ids = DynamicSimpleSGLangSelector._collect_pending_request_ids(scheduler)
+                        logger.warning(
+                            "Reference scheduler cache reset blocked on rank=%s. Pending request ids: %s",
+                            rank,
+                            pending_ids,
+                        )
                     end_of_cache_loc = 0
-                    ack_queue.put(end_of_cache_loc)
+                    ack_queue.put(reset_ok)
                     continue
             else:
                 new_batch = ScheduleBatch.init_new(
@@ -384,11 +557,10 @@ class DynamicSimpleSGLangSelector:
         batch.output_ids = next_token_ids
 
         for req, next_token_id in zip(batch.reqs, next_token_ids):
-            if next_token_id in self.quick_scheduler.model_config.hf_eos_token_id:
-                scheduler.abort_request(AbortReq(req.rid))
             req.output_ids.append(next_token_id.item())
             req.check_finished()
             if req.finished():
+                scheduler.abort_request(AbortReq(req.rid))
                 scheduler.tree_cache.cache_finished_req(req)
 
         scheduler.last_batch = batch
@@ -611,13 +783,94 @@ class DynamicSimpleSGLangSelector:
         return generated_texts, None
 
     def reset_cache_simple(self):
-        """Reset the cache for the quick model"""
+        """Reset the cache for both quick and reference models"""
+        mem_before_alloc = 0.0
+        mem_before_reserved = 0.0
+        if torch.cuda.is_available() and self.quick_gpu_id >= 0:
+            with torch.cuda.device(self.quick_gpu_id):
+                mem_before_alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+                mem_before_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+
+        quick_reset_ok = True
+        try:
+            quick_reset_ok = bool(self.quick_scheduler.flush_cache())
+        except Exception:
+            quick_reset_ok = False
+
+        if not quick_reset_ok:
+            pending_ids = self._collect_pending_request_ids(self.quick_scheduler)
+            logger.warning(
+                "Quick scheduler cache reset blocked. Pending request ids: %s",
+                pending_ids,
+            )
+            pre_abort_snapshot = self._snapshot_request_states(self.quick_scheduler, pending_ids)
+            logger.warning(
+                "Quick scheduler pending request states before force-abort: %s",
+                pre_abort_snapshot,
+            )
+            # Boundary cleanup: force-abort lingering requests before retrying flush.
+            for rid in pending_ids:
+                try:
+                    self.quick_scheduler.abort_request(AbortReq(rid))
+                except Exception:
+                    pass
+
+            post_abort_snapshot = self._snapshot_request_states(self.quick_scheduler, pending_ids)
+            logger.warning(
+                "Quick scheduler pending request states after force-abort (before detach): %s",
+                post_abort_snapshot,
+            )
+
+            self._detach_request_ids_from_scheduler(self.quick_scheduler, pending_ids)
+
+            post_detach_snapshot = self._snapshot_request_states(self.quick_scheduler, pending_ids)
+            logger.warning(
+                "Quick scheduler pending request states after detach: %s",
+                post_detach_snapshot,
+            )
+
+            try:
+                quick_reset_ok = bool(self.quick_scheduler.flush_cache())
+            except Exception:
+                quick_reset_ok = False
+
+            if not quick_reset_ok:
+                remaining_ids = self._collect_pending_request_ids(self.quick_scheduler)
+                logger.warning(
+                    "Quick scheduler cache reset still blocked after force-abort. Remaining request ids: %s",
+                    remaining_ids,
+                )
+            else:
+                logger.warning(
+                    "Quick scheduler cache reset succeeded after force-abort and detach. Previously pending request ids: %s",
+                    pending_ids,
+                )
+
+        # Release PyTorch cached blocks on quick GPU after scheduler-level reset.
+        if torch.cuda.is_available() and self.quick_gpu_id >= 0:
+            with torch.cuda.device(self.quick_gpu_id):
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+                mem_after_alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+                mem_after_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+            logger.warning(
+                "Quick reset result=%s, mem_allocated %.3f->%.3f GB, mem_reserved %.3f->%.3f GB",
+                quick_reset_ok,
+                mem_before_alloc,
+                mem_after_alloc,
+                mem_before_reserved,
+                mem_after_reserved,
+            )
+
         for q in self.reference_model_input_queues:
             q.put_nowait("RESET_CACHE")
-        # Wait for acknowledgment from the reference model
+
+        reference_reset_ok = True
         for q in self.reference_model_ack_queues:
-            ack = q.get()    
-            # print(f"cache location reset to {ack}")
+            ack = q.get()
+            reference_reset_ok = reference_reset_ok and bool(ack)
+
+        return quick_reset_ok and reference_reset_ok
 
     def shutdown(self):
         """Shut down the SGLang engines to free resources"""

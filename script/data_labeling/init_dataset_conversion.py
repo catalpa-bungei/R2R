@@ -15,6 +15,71 @@ import pandas as pd
 from r2r.evaluate.eval_utils import prepare_multiple_choice_prompt
 from r2r.utils.dataset_conversion import BeSpokeStratosDataset
 
+# Support loading local datasets in various formats (parquet, jsonl, json) with auto-detection of splits based on filename patterns. This allows users to easily convert their own datasets without needing to follow a strict directory structure or naming convention. The script will attempt to load the dataset using HuggingFace's load_from_disk first, and if that fails, it will look for local files in the specified directory. It will then use the appropriate loader based on the file format and organize the data into splits for further processing.
+def _extract_split_name_from_filename(filename: str) -> str:
+    base_name = os.path.basename(filename)
+    if "-" in base_name:
+        return base_name.split("-", 1)[0]
+    return os.path.splitext(base_name)[0]
+
+
+def _resolve_dataset_split(loaded_dataset, requested_split: str):
+    if hasattr(loaded_dataset, "keys"):
+        available_splits = list(loaded_dataset.keys())
+        if requested_split in loaded_dataset:
+            return loaded_dataset[requested_split], requested_split
+        fallback_split = available_splits[0]
+        print(
+            f"Warning: requested split '{requested_split}' not found. "
+            f"Using available split '{fallback_split}' instead."
+        )
+        return loaded_dataset[fallback_split], fallback_split
+    return loaded_dataset, requested_split
+
+
+def load_local_dataset(dataset_path: str, dataset_split: str):
+    try:
+        loaded_dataset = load_from_disk(dataset_path)
+        return _resolve_dataset_split(loaded_dataset, dataset_split)
+    except Exception:
+        pass
+
+    if not os.path.isdir(dataset_path):
+        raise ValueError(f"Local dataset path does not exist or is not a directory: {dataset_path}")
+
+    parquet_files = sorted(
+        [f for f in os.listdir(dataset_path) if f.endswith(".parquet") and "_results" not in f]
+    )
+    jsonl_files = sorted([f for f in os.listdir(dataset_path) if f.endswith(".jsonl")])
+    json_files = sorted([f for f in os.listdir(dataset_path) if f.endswith(".json")])
+
+    data_files = {}
+    loader_name = None
+
+    if parquet_files:
+        loader_name = "parquet"
+        for filename in parquet_files:
+            split_name = _extract_split_name_from_filename(filename)
+            data_files.setdefault(split_name, []).append(os.path.join(dataset_path, filename))
+    elif jsonl_files:
+        loader_name = "json"
+        for filename in jsonl_files:
+            split_name = _extract_split_name_from_filename(filename)
+            data_files.setdefault(split_name, []).append(os.path.join(dataset_path, filename))
+    elif json_files:
+        loader_name = "json"
+        for filename in json_files:
+            split_name = _extract_split_name_from_filename(filename)
+            data_files.setdefault(split_name, []).append(os.path.join(dataset_path, filename))
+    else:
+        raise ValueError(
+            f"Directory {dataset_path} is neither a `Dataset` directory nor contains local parquet/json/jsonl files."
+        )
+
+    loaded_dataset = load_dataset(loader_name, data_files=data_files)
+    return _resolve_dataset_split(loaded_dataset, dataset_split)
+# End of modification for local dataset loading
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Convert datasets to a unified format for LLM processing"
@@ -172,9 +237,8 @@ def main():
         # Load the dataset
         try:
             if args.is_local:
-                dataset = load_from_disk(dataset_path)
-                if dataset_split and dataset_split in dataset:
-                    dataset = dataset[dataset_split]
+                dataset, resolved_split = load_local_dataset(dataset_path, dataset_split)
+                print(f"Loaded local dataset split: {resolved_split}")
             else:
                 if dataset_subset:
                     dataset = load_dataset(
@@ -229,6 +293,20 @@ def main():
     output_path = args.output_dir
     unified_dataset.save_to_disk(output_path)
     print(f"Saved unified dataset with {len(unified_dataset)} items to {output_path}")
+
+    # Also save JSONL with the same base name next to the Arrow dataset directory
+    output_base_name = os.path.basename(os.path.normpath(output_path))
+    output_parent_dir = os.path.dirname(os.path.normpath(output_path))
+    jsonl_path = os.path.join(output_parent_dir, f"{output_base_name}.jsonl")
+    pd.DataFrame(
+        {
+            "id": [item["id"] for item in all_converted_data],
+            "question": [item["question"] for item in all_converted_data],
+            "source": [item["source"] for item in all_converted_data],
+            "type": [item["type"] for item in all_converted_data],
+        }
+    ).to_json(jsonl_path, orient="records", lines=True, force_ascii=False)
+    print(f"Saved unified dataset JSONL with {len(unified_dataset)} items to {jsonl_path}")
 
 if __name__ == "__main__":
     main()

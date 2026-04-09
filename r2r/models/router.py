@@ -8,8 +8,42 @@ import json
 import pandas as pd
 import math
 import inspect
-from transformers import AutoModelForCausalLM
+from transformers import AutoModel, AutoModelForCausalLM
 from typing import List
+
+
+def _load_pretrained_router_model(pretrained_model_name: str):
+    """Load a pretrained model for router setup, supporting both text-only and VL configs."""
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            pretrained_model_name,
+            trust_remote_code=True,
+        )
+    except Exception as causal_exc:
+        print(
+            f"AutoModelForCausalLM load failed for {pretrained_model_name}: {causal_exc}. "
+            "Trying AutoModel fallback for VL or custom configs."
+        )
+        return AutoModel.from_pretrained(
+            pretrained_model_name,
+            trust_remote_code=True,
+        )
+
+
+def _get_output_embedding_layer(model):
+    """Best-effort getter for output embedding layer across model wrappers."""
+    if hasattr(model, "get_output_embeddings"):
+        layer = model.get_output_embeddings()
+        if layer is not None and hasattr(layer, "weight"):
+            return layer
+
+    language_model = getattr(model, "language_model", None)
+    if language_model is not None and hasattr(language_model, "get_output_embeddings"):
+        layer = language_model.get_output_embeddings()
+        if layer is not None and hasattr(layer, "weight"):
+            return layer
+
+    raise ValueError("Model does not provide a usable output embedding layer.")
 
 
 def load_config_from_folder(folder_path: str) -> dict:
@@ -681,13 +715,12 @@ class HiddenStatesClassifierWithLMHead(nn.Module):
         
         # Copy weights from a pretrained LM head
         try:
-            pretrained_model = AutoModelForCausalLM.from_pretrained(
-                pretrained_model_name
-            )
-            lm_head_weight = pretrained_model.get_output_embeddings().weight
+            pretrained_model = _load_pretrained_router_model(pretrained_model_name)
+            output_embeddings = _get_output_embedding_layer(pretrained_model)
+            lm_head_weight = output_embeddings.weight
             lm_head_bias = (
-                pretrained_model.get_output_embeddings().bias
-                if hasattr(pretrained_model.get_output_embeddings(), "bias")
+                output_embeddings.bias
+                if hasattr(output_embeddings, "bias")
                 else None
             )
             
@@ -803,9 +836,7 @@ class HiddenStatesTokenLMHeadClassifier(nn.Module):
         
         # Copy weights from a pretrained LM head
         try:
-            pretrained_model = AutoModelForCausalLM.from_pretrained(
-                pretrained_model_name
-            )
+            pretrained_model = _load_pretrained_router_model(pretrained_model_name)
             
             # Get the token embeddings from the pretrained model and create a copy
             embedding_layer = pretrained_model.get_input_embeddings()
@@ -924,9 +955,7 @@ class HiddenStatesTokenLMHeadLogitsClassifier(nn.Module):
         
         # Copy weights from a pretrained LM head
         try:
-            pretrained_model = AutoModelForCausalLM.from_pretrained(
-                pretrained_model_name
-            )
+            pretrained_model = _load_pretrained_router_model(pretrained_model_name)
             
             # Get the token embeddings from the pretrained model and create a copy
             embedding_layer = pretrained_model.get_input_embeddings()
@@ -1846,15 +1875,12 @@ class MultiClassHiddenStatesClassifierWithLMHead(nn.Module):
         
         # Copy weights from a pretrained LM head
         try:
-            from transformers import AutoModelForCausalLM
-
-            pretrained_model = AutoModelForCausalLM.from_pretrained(
-                pretrained_model_name
-            )
-            lm_head_weight = pretrained_model.get_output_embeddings().weight
+            pretrained_model = _load_pretrained_router_model(pretrained_model_name)
+            output_embeddings = _get_output_embedding_layer(pretrained_model)
+            lm_head_weight = output_embeddings.weight
             lm_head_bias = (
-                pretrained_model.get_output_embeddings().bias
-                if hasattr(pretrained_model.get_output_embeddings(), "bias")
+                output_embeddings.bias
+                if hasattr(output_embeddings, "bias")
                 else None
             )
             

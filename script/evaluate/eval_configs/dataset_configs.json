@@ -1,13 +1,13 @@
 {
     "aime": {
         "name": "AIME Mathematical Problems, default to AIME24-25",
-        "path": "GY2233/AIME-2024-2025",
+        "path": "/mnt/shared-storage-user/yangxuqing/AIME/aime24",
         "answer_type": "boxed",
-        "id_field": "ID",
-        "question_field": "Problem",
-        "answer_field": "Answer",
+        "id_field": "id",
+        "question_field": "problem",
+        "answer_field": "solution",
         "prompt_template": "{question}",
-        "description": "American Invitational Mathematics Examination problems with numerical answers from 2024 to 2025"
+        "description": "American Invitational Mathematics Examination problems with numerical answers from local AIME24 parquet data"
     },
     "aime23": {
         "name": "AIME Mathematical Problems",
@@ -35,7 +35,7 @@
     },
     "gpqa": {
         "name": "GPQA Diamond Multiple Choice",
-        "path": "Idavidrein/gpqa",
+        "path": "/mnt/shared-storage-user/yangxuqing/GPQA/gpqa/gpqa_diamond.csv",
         "dataset_config": "gpqa_diamond",
         "answer_type": "multiple_choice",
         "id_field": "Record ID",
@@ -47,7 +47,7 @@
     },
     "gpqa_extended": {
         "name": "GPQA Extended Multiple Choice",
-        "path": "Idavidrein/gpqa",
+        "path": "/mnt/shared-storage-user/yangxuqing/GPQA/gpqa/gpqa_extended.csv",
         "dataset_config": "gpqa_extended",
         "answer_type": "multiple_choice",
         "id_field": "Record ID",
@@ -113,5 +113,33 @@
         "options_fields": "options",
         "description": "Multiple-choice questions from MMLU-Redux dataset",
         "selected_subjects": "test"
+    },
+    "TruthfulQA": {
+        "name": "TruthfulQA Multiple Choice",
+        "path": "/mnt/shared-storage-user/yangxuqing/TruthfulQA/multiple_choice/validation-00000-of-00001.parquet",
+        "dataset_config": "multiple_choice",
+        "split": "validation",
+        "answer_type": "multiple_choice",
+        "id_field": "question_id",
+        "question_field": "question",
+        "answer_field": "mc1_targets",
+        "options_fields": "mc1_targets.choices",
+        "labels_field": "mc1_targets.labels",
+        "prompt_template": "",
+        "description": "TruthfulQA multiple-choice benchmark using mc1 single-correct targets"
+    },
+    "mmlu":{
+        "name": "MMLU",
+        "path": "/mnt/shared-storage-user/yangxuqing/mmlu/mmlu/all/val/validation-00000-of-00001.parquet",
+        "answer_type": "multiple_choice",
+        "split": "validation",
+        "id_field": "question_id",
+        "question_field": "question",
+        "answer_field": "answer",
+        "prompt_template": "",
+        "options_fields": "choices",
+        "labels_field": "answer",
+        "description": "Multiple-choice questions from MMLU dataset",
+        "selected_subjects": "validation"
     }
 }

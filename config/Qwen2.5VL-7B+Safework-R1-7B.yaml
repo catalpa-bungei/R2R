@@ -4,8 +4,8 @@
     "think_end": 151668
   },
   "quick": {
-    "model_name": "Qwen2.5-7B-Instruct",
-    "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28",
+    "model_name": "Qwen2.5VL-7B-Instruct",
+    "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen2.5VL-7B-Instruct/5b5eecc7efc2c3e86839993f2689bbbdf06bd8d4",
     "param": "7",
     "mem_fraction_static": 0.15
   },
@@ -35,18 +35,15 @@
     "model_name": "Qwen3-32B",
     "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137",
     "mem_fraction_static": 0.90,
-    "max_new_tokens": 1024,
+    "max_new_tokens": 16,
     "base_gpu_id": 0,
-    "tp_size": 1,
-    "apply_chat_template_kwargs": {
-      "enable_thinking": false
-    }
+    "tp_size": 1
   },
   "router": {
-    "router_name": "Qwen2.5-7B+Safework-R1-7B",
+    "router_name": "Qwen2.5VL-7B+Safework-R1-7B",
     "router_path": "/mnt/shared-storage-user/yangxuqing/R2R/Routers/R2R_router/Qwen3-0.6B+Qwen3-8B/default_router.pt",
     "override_init_args":{
-      "pretrained_model_name": "/mnt/shared-storage-user/yangxuqing/models/Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28"
+      "pretrained_model_name": "/mnt/shared-storage-user/yangxuqing/models/Qwen2.5VL-7B-Instruct/5b5eecc7efc2c3e86839993f2689bbbdf06bd8d4"
     }
   }
 }

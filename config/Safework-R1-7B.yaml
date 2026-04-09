@@ -4,8 +4,8 @@
     "think_end": 151668
   },
   "quick": {
-    "model_name": "Qwen2.5-7B-Instruct",
-    "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28",
+    "model_name": "Safework-R1-Qwen2.5VL-7B",
+    "model_path": "/mnt/shared-storage-user/yangxuqing/models/SafeWork-R1-Qwen2.5VL-7B",
     "param": "7",
     "mem_fraction_static": 0.15
   },
@@ -13,7 +13,7 @@
     "model_name": "Safework-R1-Qwen2.5VL-7B",
     "model_path": "/mnt/shared-storage-user/yangxuqing/models/SafeWork-R1-Qwen2.5VL-7B",
     "param": "7",
-    "mem_fraction_static": 0.80
+    "mem_fraction_static": 0.15
   },
   "continuation_main": {
     "model_name": "Safework-R1-Qwen2.5VL-7B",
@@ -43,8 +43,9 @@
     }
   },
   "router": {
-    "router_name": "Qwen2.5-7B+Safework-R1-7B",
-    "router_path": "/mnt/shared-storage-user/yangxuqing/R2R/Routers/R2R_router/Qwen3-0.6B+Qwen3-8B/default_router.pt",
+    "router_name": "Safework-R1-7B",
+    "router_path": "/mnt/shared-storage-user/yangxuqing/R2R/resource/default_router_qwen2_5_7b_all.pt/classifier_20260323_145507_all.pt",
+    "threshold": 0.6039393939393939,
     "override_init_args":{
       "pretrained_model_name": "/mnt/shared-storage-user/yangxuqing/models/Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28"
     }

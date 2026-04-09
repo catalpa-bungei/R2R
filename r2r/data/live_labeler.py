@@ -1,6 +1,6 @@
 from typing import List, Tuple, Optional, Union
 
-from r2r.data.generation_controller import ModelController, DivergePoint
+from R2R.r2r.data.generation_controller_original import ModelController, DivergePoint
 from r2r.data.verify_model import VerifyModel, ComparisonPoint
 from transformers import AutoTokenizer
 

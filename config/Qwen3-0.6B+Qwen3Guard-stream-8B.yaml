@@ -10,37 +10,38 @@
     "mem_fraction_static": 0.15
   },
   "reference": {
-    "model_name": "Qwen3-32B",
-    "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137",
-    "param": "32",
+    "model_name": "Qwen3Guard-Stream-8B",
+    "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen3Guard-Stream-8B",
+    "param": "8",
+    "tp_size": 1,
     "mem_fraction_static": 0.80
   },
   "continuation_main": {
-    "model_name": "Qwen3-32B",
-    "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137",
-    "param": "32",
-    "tp_size": 2,
+    "model_name": "Qwen3Guard-Stream-8B",
+    "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen3Guard-Stream-8B",
+    "param": "8",
+    "tp_size": 1,
     "base_gpu_id": 2,
     "mem_fraction_static": 0.90
   },
   "continuation_reference": {
-    "model_name": "Qwen3-32B",
-    "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137",
-    "param": "32",
+    "model_name": "Qwen3Guard-Stream-8B",
+    "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen3Guard-Stream-8B",
+    "param": "8",
     "tp_size": 1,
     "base_gpu_id": 3,
     "mem_fraction_static": 0.90
   },
   "verify": {
-    "model_name": "Qwen3-32B",
-    "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137",
+    "model_name": "Qwen3Guard-Stream-8B",
+    "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen3Guard-Stream-8B",
     "mem_fraction_static": 0.90,
     "max_new_tokens": 16,
     "base_gpu_id": 0,
-    "tp_size": 2
+    "tp_size": 1
   },
   "router": {
-    "router_name": "Qwen3-0.6B+Qwen3-32B",
+    "router_name": "Qwen3-0.6B+Qwen3Guard-stream-8B",
     "router_path": "/mnt/shared-storage-user/yangxuqing/R2R/Routers/R2R_router/Qwen3-0.6B+Qwen3-8B/default_router.pt",
     "override_init_args":{
       "pretrained_model_name": "/mnt/shared-storage-user/yangxuqing/models/Qwen3-0.6B/snapshots/e6de91484c29aa9480d55605af694f39b081c455"

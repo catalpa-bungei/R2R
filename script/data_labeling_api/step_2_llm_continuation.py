@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 from r2r.data.data_process import DataProcessor, MismatchPoint
-from r2r.data.generation_controller import ModelController, DivergePoint
+from R2R.r2r.data.generation_controller_original import ModelController, DivergePoint
 from r2r.data.verify_model import ComparisonPoint, data_points_to_df
 
 def parse_args():

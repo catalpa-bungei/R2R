@@ -11,19 +11,20 @@
         "type": "default"
     },
     "aime":{
-        "dataset_path": "di-zhang-fdu/AIME_1983_2024",
+        "dataset_path": "/mnt/shared-storage-user/yangxuqing/AIME/aime24",
+        "dataset_split": "test",
         "id_field": "id",
         "message_format": [
             {
-                "role": "user",
-                "content_field": "Question"
+                "role": "user", 
+                "content_field": "problem"
             }
         ], 
         "add_generation_prompt": true,
         "type": "Math"
     },
     "gpqa_extended": {
-        "dataset_path": "Idavidrein/gpqa",
+        "dataset_path": "/mnt/shared-storage-user/yangxuqing/GPQA/gpqa/gpqa_extended.csv",
         "dataset_subset": "gpqa_extended",
         "id_field": "id",
         "message_format": [

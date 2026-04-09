@@ -1,4 +1,5 @@
 import os
+import glob
 from pdb import runcall
 import sys
 import torch
@@ -33,6 +34,57 @@ from r2r.train.loss import FocalLoss, DPOLoss
 from r2r.train.logger import filter_data_id_critical, filter_is_mismatch, filter_has_divergent, print_training_progress, TrainingHistory, create_mask, create_mismatch
 from r2r.models.router import save_model, load_model
 from r2r.train.optimizer import optimization_pipeline, standard_eval_pipeline
+
+
+def _extract_local_dataset_dirs(path_config: Union[str, List[str]]) -> List[str]:
+    """Extract local HuggingFace dataset directories from config path(s)."""
+    path_list = [path_config] if isinstance(path_config, str) else path_config
+    local_dirs = []
+    for path in path_list:
+        if isinstance(path, str) and path.startswith("local:"):
+            local_path = path.split(":", 1)[1]
+            if os.path.isdir(local_path):
+                local_dirs.append(os.path.abspath(local_path))
+    return local_dirs
+
+
+def _cleanup_stale_hf_cache_files(dataset_dirs: List[str], active_datasets: List[Any]) -> None:
+    """Remove stale cache-*.arrow files while preserving cache files in active datasets."""
+    if not dataset_dirs:
+        return
+
+    protected_files = set()
+    for ds in active_datasets:
+        cache_files = getattr(ds, "cache_files", None)
+        if not cache_files:
+            continue
+        for cache_info in cache_files:
+            filename = cache_info.get("filename")
+            if filename:
+                protected_files.add(os.path.abspath(filename))
+
+    removed_count = 0
+    scanned_count = 0
+    for dataset_dir in dataset_dirs:
+        pattern = os.path.join(dataset_dir, "**", "cache-*.arrow")
+        for cache_file in glob.iglob(pattern, recursive=True):
+            if not os.path.isfile(cache_file):
+                continue
+            abs_cache_file = os.path.abspath(cache_file)
+            scanned_count += 1
+            if abs_cache_file in protected_files:
+                continue
+            try:
+                os.remove(abs_cache_file)
+                removed_count += 1
+            except OSError as e:
+                print(f"Warning: failed to remove cache file {cache_file}: {e}")
+
+    print(
+        f"Post-preprocessing cache cleanup complete: removed {removed_count} stale cache files "
+        f"out of {scanned_count} scanned across {len(dataset_dirs)} dataset "
+        f"director{'y' if len(dataset_dirs) == 1 else 'ies'}."
+    )
 
 def load_dataset_from_config(dataset_path: str):
     """
@@ -220,7 +272,7 @@ def train_model(
 ) -> tuple[nn.Module, TrainingHistory]:
     """
     Train the model with early stopping and detailed within-epoch logging.
-    Save checkpoints after each epoch and select the best one at the end.
+    Save checkpoints every 10 epochs, at the last epoch, and always save the best epoch.
 
     Args:
         model: The model to train
@@ -349,7 +401,15 @@ def train_model(
             "val_pos_rate": val_pos_rate,
         }
         
-        improved = history.save_checkpoint(epoch, model, optimizer, val_metrics_dict)
+        # Save epoch checkpoints every 10 epochs and at the configured final epoch.
+        save_epoch_file = ((epoch + 1) % 10 == 0) or (epoch == num_epochs - 1)
+        improved = history.save_checkpoint(
+            epoch,
+            model,
+            optimizer,
+            val_metrics_dict,
+            save_epoch_file=save_epoch_file,
+        )
         
         if improved:
             counter = 0
@@ -358,6 +418,15 @@ def train_model(
             counter += 1
             print(f"No improvement for {counter}/{patience} epochs")
             if counter >= patience:
+                # Ensure the actual last trained epoch is also checkpointed before stopping.
+                if not save_epoch_file:
+                    history.save_checkpoint(
+                        epoch,
+                        model,
+                        optimizer,
+                        val_metrics_dict,
+                        save_epoch_file=True,
+                    )
                 print(f"Early stopping at epoch {epoch+1}")
                 break
                 
@@ -577,6 +646,9 @@ def main(config: dict, use_wandb: bool = False, validate_model_path: Optional[st
     """Data"""
     data_config = config["data"]
 
+    local_dataset_dirs = set()
+    local_dataset_dirs.update(_extract_local_dataset_dirs(data_config["train"]["path"]))
+
     # load training dataset
     train_dataset_path: Union[str, List[str]] = data_config["train"]["path"]
     # Check if train_dataset_path is a list
@@ -597,6 +669,7 @@ def main(config: dict, use_wandb: bool = False, validate_model_path: Optional[st
     # load test dataset
     if (not "split_test_from_train" in data_config["test"]) or (not data_config["test"]["split_test_from_train"]):
         test_dataset_path: Union[str, List[str]] = data_config["test"]["path"] # Add type hint
+        local_dataset_dirs.update(_extract_local_dataset_dirs(test_dataset_path))
         # Check if test_dataset_path is a list
         if isinstance(test_dataset_path, list):
             # Load and concatenate datasets
@@ -732,6 +805,12 @@ def main(config: dict, use_wandb: bool = False, validate_model_path: Optional[st
             datasets[split] = datasets[split].filter(lambda ex: ex["mask"] == 1 and ex["divergent"] in [0, 1], num_proc=32)
             after = len(datasets[split])
             print(f"Filtered {split} dataset by mask: {before} -> {after}")
+
+    # Clean stale cache shards created by prior runs while preserving currently referenced files.
+    _cleanup_stale_hf_cache_files(
+        dataset_dirs=sorted(local_dataset_dirs),
+        active_datasets=[datasets["train"], datasets["test"]],
+    )
 
     # Use multiple workers for faster data loading if available
     num_workers = 4 if torch.cuda.is_available() else 0

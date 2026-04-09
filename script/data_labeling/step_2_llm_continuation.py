@@ -166,6 +166,13 @@ def get_processed_data_ids_and_full_results(results_path):
 
 def main():
     args = parse_args()
+
+    def normalize_path(path: str) -> Path:
+        """Normalize path by replacing different mount prefixes for reliable comparison."""
+        path = str(path)
+        if path.startswith('/mnt/public'):
+            path = path.replace('/mnt/public', '/share/public')
+        return Path(path)
     
     # Check MODEL_DICT consistency with the models used in the input data
     logger.info("Checking MODEL_DICT consistency...")
@@ -253,6 +260,28 @@ def main():
 
     # Initialize the generation controller and verify model
     gen_controller = ModelController(comparison_model='real', mem_fraction_static=args.gen_mem_fraction, tp_size=args.tp_size, dp_size=args.dp_size)
+
+    # Always print runtime-loaded model routing so continuation provenance is explicit.
+    runtime_small_path = getattr(gen_controller, 'small_model_path', None)
+    runtime_reference_path = getattr(gen_controller, 'reference_model_path', None)
+    quick_path = MODEL_DICT['quick']['model_path']
+    reference_path = MODEL_DICT['reference']['model_path']
+
+    logger.info("Continuation model routing (runtime):")
+    logger.info(f"  quick(SLM) path: {quick_path}")
+    logger.info(f"  reference(LLM) path: {reference_path}")
+    logger.info(f"  loaded continuation main (False SLM) path: {runtime_small_path}")
+    logger.info(f"  loaded continuation reference (LLM) path: {runtime_reference_path}")
+
+    is_small_cont_from_slm = runtime_small_path is not None and (
+        normalize_path(runtime_small_path) == normalize_path(quick_path)
+    )
+    small_branch_verdict = (
+        "SLM-token+SLM-continuation"
+        if is_small_cont_from_slm
+        else "SLM-token+LLM-continuation"
+    )
+    logger.info(f"Verdict small_outputs_batch route: {small_branch_verdict}")
     
     logger.info("verify model disabled (--verify flag not provided)")
         
