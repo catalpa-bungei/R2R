@@ -753,7 +753,13 @@ class NeuralMultiInputSwitching(ModelSwitchingStrategy):
 class RandomSwitching(ModelSwitchingStrategy):
     """Random switching strategy that selects reference model with a given probability"""
     
-    def __init__(self, reference_prob: float = 0.5, random_seed: Optional[int] = 42):
+    def __init__(
+        self,
+        reference_prob: float = 0.5,
+        random_seed: Optional[int] = 42,
+        override_init_args: Optional[dict] = None,
+        **kwargs,
+    ):
         """Initialize random switching strategy
         
         Args:
@@ -762,11 +768,16 @@ class RandomSwitching(ModelSwitchingStrategy):
         """
         super().__init__()
         self.reference_prob = reference_prob
+        # Keep signature compatible with shared strategy kwargs passed by the factory.
+        self.override_init_args = override_init_args
         
         # Set random seed
         random.seed(random_seed)
             
-        print(f"Initialized RandomSwitching with reference_prob={reference_prob}, random_seed={random_seed}")
+        print(
+            f"Initialized RandomSwitching with reference_prob={reference_prob}, "
+            f"random_seed={random_seed}"
+        )
     
     def route(self, outputs) -> torch.Tensor:
         """Randomly select between quick and reference models

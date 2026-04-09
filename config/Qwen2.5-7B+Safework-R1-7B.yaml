@@ -46,6 +46,7 @@
     "router_name": "Qwen2.5-7B+Safework-R1-7B",
     "router_path": "/mnt/shared-storage-user/yangxuqing/R2R/resource/default_router_qwen2_5_7b_all.pt/classifier_20260323_145507_all.pt",
     "threshold": 0.6039393939393939,
+    "switching_strategy": "random",
     "override_init_args":{
       "pretrained_model_name": "/mnt/shared-storage-user/yangxuqing/models/Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28"
     }
