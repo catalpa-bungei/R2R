@@ -141,5 +141,17 @@
         "labels_field": "answer",
         "description": "Multiple-choice questions from MMLU dataset",
         "selected_subjects": "validation"
+    },
+    "wildguardtest": {
+        "name": "wildguardtest",
+        "path": "/mnt/shared-storage-user/yangxuqing/WildGuard/WildGuardTest/data/train-00000-of-00001.parquet",
+        "dataset_config": "wildguardtest",
+        "split": "validation",
+        "answer_type": "wildguardtest",
+        "id_field": "question_id",
+        "question_field": "prompt",
+        "answer_field": "label",
+        "prompt_template": "",
+        "description": "WildGuardTest dataset"
     }
 }
