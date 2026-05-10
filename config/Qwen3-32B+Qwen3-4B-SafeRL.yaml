@@ -1,0 +1,53 @@
+{
+  "special_tokens": {
+    "think_start": 151667,
+    "think_end": 151668
+  },
+  "quick": {
+    "model_name": "Qwen3-32B",
+    "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137",
+    "param": "32",
+    "mem_fraction_static": 0.80
+  },
+  "reference": {
+    "model_name": "Qwen3-4B-SafeRL",
+    "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen3-4B-SafeRL",
+    "param": "4",
+    "mem_fraction_static": 0.30
+  },
+  "continuation_main": {
+    "model_name": "Qwen3-4B-SafeRL",
+    "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen3-4B-SafeRL",
+    "param": "4",
+    "tp_size": 1,
+    "base_gpu_id": 0,
+    "mem_fraction_static": 0.90
+  },
+  "continuation_reference": {
+    "model_name": "Qwen3-4B-SafeRL",
+    "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen3-4B-SafeRL",
+    "param": "4",
+    "tp_size": 1,
+    "base_gpu_id": 0,
+    "mem_fraction_static": 0.90
+  },
+  "verify": {
+    "model_name": "Qwen3-32B",
+    "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137",
+    "mem_fraction_static": 0.90,
+    "max_new_tokens": 1024,
+    "base_gpu_id": 0,
+    "tp_size": 2,
+    "apply_chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "router": {
+    "router_name": "Qwen3-32B+Qwen3-4B-SafeRL",
+    "router_path": "/mnt/shared-storage-user/yangxuqing/R2R/Routers/R2R_router/default_router.pt",
+    "switching_strategy": "random",
+    "override_init_args": {
+      "pretrained_model_name": "/mnt/shared-storage-user/yangxuqing/models/Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137"
+    }
+  }
+}

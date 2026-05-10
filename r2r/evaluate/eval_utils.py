@@ -19,7 +19,7 @@ C) {C}
 D) {D}
 """.strip()
 
-ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer[ \t]*:[ \t]*\$?([A-D])\$?"
+ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer[ \t]*:[ \t]*\$?([A-Z]+)\$?"
 
 
 ## USED FOR MMLU-PRO ###
@@ -77,7 +77,7 @@ def extract_boxed_answer(text: str) -> Tuple[str, bool]:
     return "", False
 
 def extract_multiple_choice_answer(text: str) -> Tuple[str, bool]:
-    """Extract multiple-choice answer (A, B, C, or D) from the generated text."""
+    """Extract multiple-choice answer label (A-Z, AA, AB, ...) from generated text."""
     # Look for answer statements like "The answer is A" or "I choose B"
     
     match = re.search(ANSWER_PATTERN_MULTICHOICE, text)

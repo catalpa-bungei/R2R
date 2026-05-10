@@ -1018,19 +1018,24 @@ def preprocess_dataset(dataset, dataset_config: Dict, save_result_dir: str) -> L
                     )
                     correct_original_index = 0
 
-                if len(options) > 4:
-                    # Keep one correct option and sample 3 incorrect options so answer stays in A-D.
-                    incorrect_indices = [i for i in range(len(options)) if i != correct_original_index]
-                    np.random.shuffle(incorrect_indices)
-                    selected_indices = [correct_original_index] + incorrect_indices[:3]
-                else:
-                    selected_indices = list(range(len(options)))
+                selected_indices = list(range(len(options)))
 
-                np.random.shuffle(selected_indices)
+                # np.random.shuffle(selected_indices)
                 shuffled_options = [options[i] for i in selected_indices]
 
                 correct_index = selected_indices.index(correct_original_index)
-                correct_letter = chr(65 + correct_index)
+
+                def to_option_label(idx: int) -> str:
+                    # Excel-like labels: 0->A, 25->Z, 26->AA, 27->AB, ...
+                    label = ""
+                    idx += 1
+                    while idx > 0:
+                        idx, rem = divmod(idx - 1, 26)
+                        label = chr(65 + rem) + label
+                    return label
+
+                option_labels = [to_option_label(i) for i in range(len(shuffled_options))]
+                correct_letter = option_labels[correct_index]
 
                 show_logging = False
                 if show_logging:
@@ -1059,9 +1064,8 @@ def preprocess_dataset(dataset, dataset_config: Dict, save_result_dir: str) -> L
                         f"correct_option_text={options[correct_original_index]}"
                     )
 
-                option_letters = ["A", "B", "C", "D"]
                 processed_item["Options"] = {
-                    option_letters[idx]: option_text
+                    option_labels[idx]: option_text
                     for idx, option_text in enumerate(shuffled_options)
                 }
                 processed_item["Answer"] = correct_letter
@@ -1075,7 +1079,7 @@ def preprocess_dataset(dataset, dataset_config: Dict, save_result_dir: str) -> L
                         D=processed_item["Options"]["D"]
                     )
                 else:
-                    available_letters = "".join(processed_item["Options"].keys())
+                    available_letters = ", ".join(processed_item["Options"].keys())
                     options_block = "\n".join(
                         f"{letter}) {option_text}"
                         for letter, option_text in processed_item["Options"].items()
@@ -1136,7 +1140,7 @@ def preprocess_dataset(dataset, dataset_config: Dict, save_result_dir: str) -> L
                 processed_item["FormattedProblem"] = processed_item["Problem"]
                 
         processed_data.append(processed_item)
-        
+    
     return processed_data
 
 def load_dataset_with_local_support(dataset_path: str, dataset_config: Optional[str] = None):
