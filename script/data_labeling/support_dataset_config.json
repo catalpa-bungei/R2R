@@ -92,6 +92,18 @@
         "add_generation_prompt": true,
         "type": "default"
     },
+    "harmbench": {
+        "dataset_path": "/mnt/shared-storage-user/yangxuqing/HarmBench/HarmBench/standard",
+        "id_field": "id",
+        "message_format": [
+            {
+                "role": "user",
+                "content_field": "prompt"
+            }
+        ],
+        "add_generation_prompt": true,
+        "type": "Safety"
+    },
     "R2R_dataset":{
         "id_field": "id",
         "message_format": [

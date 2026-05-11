@@ -41,6 +41,8 @@ def check_answer_correctness(predicted: str, actual: str, answer_type: str) -> b
         return predicted.upper() == actual.upper()
     elif answer_type == "livecodebench":
         return True
+    elif answer_type == "safe_generation":
+        return True
     elif answer_type == "wildguardtest":
         # print(f"Comparing predicted: '{predicted}' with actual: '{actual}' for WildGuardTest")
         # print(f"Normalized predicted: '{normalize_wildguard_label(predicted)}' and normalized actual: '{normalize_wildguard_label(actual)}'")
@@ -54,6 +56,7 @@ def get_answer_extractor(dataset_type: str) -> Callable:
         "boxed": extract_boxed_answer,
         "multiple_choice": extract_multiple_choice_answer,
         "livecodebench": dummy_extract_code_answer,
+        "safe_generation": extract_safe_generation_answer,
         "mmlu-multiple-choice": extract_mmlu_pro_answer,
         "wildguardtest": extract_wildguardtest_answer
     }
@@ -90,6 +93,10 @@ def extract_multiple_choice_answer(text: str) -> Tuple[str, bool]:
 def dummy_extract_code_answer(text: str) -> Tuple[str, bool]:
     """Dummy function to extract code from the generated text."""
     return text, False
+
+def extract_safe_generation_answer(text: str) -> Tuple[str, bool]:
+    """Return the raw model response for safe-generation datasets."""
+    return text, bool(text.strip())
 
 def extract_code_answer(text: str) -> Tuple[str, bool]:
     """Extract Python code from the generated text."""

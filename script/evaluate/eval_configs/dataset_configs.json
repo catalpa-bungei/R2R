@@ -147,7 +147,7 @@
         "path": "/mnt/shared-storage-user/yangxuqing/HarmBench/HarmBench/standard/train-00000-of-00001.parquet",
         "dataset_config": "harmbench",
         "split": "train",
-        "answer_type": "default",
+        "answer_type": "safe_generation",
         "id_field": "id",
         "question_field": "prompt",
         "answer_field": "category",
