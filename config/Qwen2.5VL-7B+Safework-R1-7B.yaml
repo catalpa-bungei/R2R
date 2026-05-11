@@ -13,7 +13,8 @@
     "model_name": "Safework-R1-Qwen2.5VL-7B",
     "model_path": "/mnt/shared-storage-user/yangxuqing/models/SafeWork-R1-Qwen2.5VL-7B",
     "param": "7",
-    "mem_fraction_static": 0.80
+    "mem_fraction_static": 0.80,
+    "restart_interval": 500
   },
   "continuation_main": {
     "model_name": "Safework-R1-Qwen2.5VL-7B",

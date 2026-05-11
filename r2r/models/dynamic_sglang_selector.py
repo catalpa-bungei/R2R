@@ -118,24 +118,17 @@ class DynamicSimpleSGLangSelector:
             **reference_sglang_kwargs,
         )
 
-        self.reference_model_input_queues = [mp.Queue() for _ in range(self.world_size)]
-        self.reference_model_ack_queues = [mp.Queue() for _ in range(self.world_size)]
-        self.reference_model_output_queue = mp.Queue()
-
-        self.reference_model_procs = []
-        for rank in range(self.world_size):
-            proc = mp.Process(
-                target=self.reference_model_worker,
-                args=(rank, self.world_size, self.reference_server_args, self.reference_model_input_queues, self.reference_model_output_queue, self.reference_model_ack_queues[rank]),
-            )
-            proc.start()
-            self.reference_model_procs.append(proc)
-
-        # Initialize prefix indices list for reference model
         self.reference_prefix_indices_list = []
-
-        # warm up the reference model
-        self.warm_up_reference_model()
+        self.reference_model_input_queues = []
+        self.reference_model_ack_queues = []
+        self.reference_model_output_queue = None
+        self.reference_model_procs = []
+        # If restart_interval is missing or 0, reference workers stay alive. If restart_interval > 0, reference workers will be restarted after processing that many tokens to mitigate memory fragmentation.
+        self.reference_restart_interval = int(
+            self.model_config.get("reference", {}).get("restart_interval", 0) or 0
+        )
+        self.reference_generate_count = 0
+        self._ensure_reference_workers()
 
         # Initialize switching strategy
         # Get override_init_args from router config
@@ -145,6 +138,85 @@ class DynamicSimpleSGLangSelector:
         self.switching_strategy = create_switching_strategy(
             switching_strategy, **self.strategy_kwargs
         )
+
+    def _reference_workers_alive(self) -> bool:
+        return (
+            len(getattr(self, "reference_model_procs", [])) == self.world_size
+            and all(proc.is_alive() for proc in self.reference_model_procs)
+        )
+
+    def _ensure_reference_workers(self) -> None:
+        """Start reference model worker processes if they are not running."""
+        if self._reference_workers_alive():
+            return
+
+        self._terminate_reference_workers()
+
+        self.reference_model_input_queues = [mp.Queue() for _ in range(self.world_size)]
+        self.reference_model_ack_queues = [mp.Queue() for _ in range(self.world_size)]
+        self.reference_model_output_queue = mp.Queue()
+        self.reference_model_procs = []
+
+        logger.warning("Starting %s reference model worker process(es).", self.world_size)
+        for rank in range(self.world_size):
+            proc = mp.Process(
+                target=self.reference_model_worker,
+                args=(
+                    rank,
+                    self.world_size,
+                    self.reference_server_args,
+                    self.reference_model_input_queues,
+                    self.reference_model_output_queue,
+                    self.reference_model_ack_queues[rank],
+                ),
+            )
+            proc.start()
+            self.reference_model_procs.append(proc)
+
+        self.reference_prefix_indices_list = []
+        self.warm_up_reference_model()
+
+    def _terminate_reference_workers(self) -> None:
+        """Terminate reference workers to release the reference model GPU memory."""
+        procs = list(getattr(self, "reference_model_procs", []) or [])
+        queues = list(getattr(self, "reference_model_input_queues", []) or [])
+
+        for q in queues:
+            try:
+                q.put_nowait(-1)
+            except Exception:
+                pass
+
+        for proc in procs:
+            try:
+                proc.join(timeout=10)
+            except Exception:
+                pass
+            if proc.is_alive():
+                logger.warning("Reference worker pid=%s did not exit; terminating.", proc.pid)
+                proc.terminate()
+                proc.join(timeout=10)
+
+        for q in queues + list(getattr(self, "reference_model_ack_queues", []) or []):
+            try:
+                q.close()
+                q.join_thread()
+            except Exception:
+                pass
+
+        output_queue = getattr(self, "reference_model_output_queue", None)
+        if output_queue is not None:
+            try:
+                output_queue.close()
+                output_queue.join_thread()
+            except Exception:
+                pass
+
+        self.reference_model_input_queues = []
+        self.reference_model_ack_queues = []
+        self.reference_model_output_queue = None
+        self.reference_model_procs = []
+        self.reference_prefix_indices_list = []
 
     def _validate_tokenizer_compatibility(self):
         quick_model_path = self.model_config["quick"]["model_path"]
@@ -362,6 +434,13 @@ class DynamicSimpleSGLangSelector:
                 break
             elif isinstance(reqs, str):
                 if reqs == "RESET_CACHE":
+                    mem_before_alloc = 0.0
+                    mem_before_reserved = 0.0
+                    if torch.cuda.is_available():
+                        with torch.cuda.device(rank):
+                            mem_before_alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+                            mem_before_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+
                     reset_ok = True
                     try:
                         reset_ok = bool(scheduler.flush_cache())
@@ -375,6 +454,21 @@ class DynamicSimpleSGLangSelector:
                             pending_ids,
                         )
                     end_of_cache_loc = 0
+                    if torch.cuda.is_available():
+                        with torch.cuda.device(rank):
+                            torch.cuda.empty_cache()
+                            torch.cuda.ipc_collect()
+                            mem_after_alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+                            mem_after_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+                        logger.warning(
+                            "Reference reset result=%s, rank=%s, mem_allocated %.3f->%.3f GB, mem_reserved %.3f->%.3f GB",
+                            reset_ok,
+                            rank,
+                            mem_before_alloc,
+                            mem_after_alloc,
+                            mem_before_reserved,
+                            mem_after_reserved,
+                        )
                     ack_queue.put(reset_ok)
                     continue
             else:
@@ -595,6 +689,7 @@ class DynamicSimpleSGLangSelector:
             If record_generation is True: tuple of (list of generated texts, list of GenerationRecorders)
         """
 
+        self._ensure_reference_workers()
         self.reset_cache_simple()
         batch_input_ids = input_ids
         batch_size = len(batch_input_ids)
@@ -778,6 +873,18 @@ class DynamicSimpleSGLangSelector:
             generated_text = output_text
             generated_texts.append(generated_text)
 
+        self.reference_generate_count += 1
+        print(f"\nself.reference_generate_count={self.reference_generate_count}; self.reference_restart_interval={self.reference_restart_interval}\n")
+        if (
+            self.reference_restart_interval > 0
+            and self.reference_generate_count % self.reference_restart_interval == 0
+        ):
+            logger.warning(
+                "Restart interval reached after %s generate call(s); terminating reference workers to release GPU memory.",
+                self.reference_generate_count,
+            )
+            self._terminate_reference_workers()
+
         if record_generation:
             return generated_texts, recorders
         return generated_texts, None
@@ -874,12 +981,8 @@ class DynamicSimpleSGLangSelector:
 
     def shutdown(self):
         """Shut down the SGLang engines to free resources"""
-        for q in self.reference_model_input_queues:
-            q.put_nowait(-1)  # Termination signal
+        self._terminate_reference_workers()
 
     def __del__(self):
         if hasattr(self, "reference_model_procs"):
-            for proc in self.reference_model_procs:
-                if proc.is_alive():
-                    proc.terminate()
-                    proc.join()
+            self._terminate_reference_workers()
