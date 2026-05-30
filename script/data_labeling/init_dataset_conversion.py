@@ -44,12 +44,31 @@ def load_local_dataset(dataset_path: str, dataset_split: str):
     except Exception:
         pass
 
+    if os.path.isfile(dataset_path):
+        extension = os.path.splitext(dataset_path)[1].lower()
+        loader_by_extension = {
+            ".csv": "csv",
+            ".json": "json",
+            ".jsonl": "json",
+            ".parquet": "parquet",
+        }
+        loader_name = loader_by_extension.get(extension)
+        if not loader_name:
+            raise ValueError(
+                f"Unsupported local dataset file extension '{extension}' for {dataset_path}. "
+                "Supported extensions: .csv, .json, .jsonl, .parquet."
+            )
+
+        loaded_dataset = load_dataset(loader_name, data_files={dataset_split: dataset_path})
+        return _resolve_dataset_split(loaded_dataset, dataset_split)
+
     if not os.path.isdir(dataset_path):
         raise ValueError(f"Local dataset path does not exist or is not a directory: {dataset_path}")
 
     parquet_files = sorted(
         [f for f in os.listdir(dataset_path) if f.endswith(".parquet") and "_results" not in f]
     )
+    csv_files = sorted([f for f in os.listdir(dataset_path) if f.endswith(".csv")])
     jsonl_files = sorted([f for f in os.listdir(dataset_path) if f.endswith(".jsonl")])
     json_files = sorted([f for f in os.listdir(dataset_path) if f.endswith(".json")])
 
@@ -59,6 +78,11 @@ def load_local_dataset(dataset_path: str, dataset_split: str):
     if parquet_files:
         loader_name = "parquet"
         for filename in parquet_files:
+            split_name = _extract_split_name_from_filename(filename)
+            data_files.setdefault(split_name, []).append(os.path.join(dataset_path, filename))
+    elif csv_files:
+        loader_name = "csv"
+        for filename in csv_files:
             split_name = _extract_split_name_from_filename(filename)
             data_files.setdefault(split_name, []).append(os.path.join(dataset_path, filename))
     elif jsonl_files:
@@ -73,7 +97,7 @@ def load_local_dataset(dataset_path: str, dataset_split: str):
             data_files.setdefault(split_name, []).append(os.path.join(dataset_path, filename))
     else:
         raise ValueError(
-            f"Directory {dataset_path} is neither a `Dataset` directory nor contains local parquet/json/jsonl files."
+            f"Directory {dataset_path} is neither a `Dataset` directory nor contains local parquet/csv/json/jsonl files."
         )
 
     loaded_dataset = load_dataset(loader_name, data_files=data_files)
@@ -168,6 +192,8 @@ def convert_dataset(args, dataset, config):
         try:
             # Extract ID or create one if not present
             item_id = item.get(config["id_field"], str(idx))
+            answer = None
+            correct_answer = None
             
             # Format input message based on configuration
             formatted_input = ""
@@ -183,7 +209,10 @@ def convert_dataset(args, dataset, config):
                     query_type = config["query_format"]["query_type"]
                     format_config = config["query_format"]
                     if query_type == "multiple_choice":
-                        content, _ = prepare_multiple_choice_prompt(item, format_config)
+                        content, answer = prepare_multiple_choice_prompt(item, format_config)
+                        options_fields = format_config.get("options_fields", [])
+                        if options_fields:
+                            correct_answer = item.get(options_fields[0], None)
                 
                 if content:  # Only add message if content is not empty
                     formatted_input = content
@@ -195,7 +224,10 @@ def convert_dataset(args, dataset, config):
                 "original_data": item,
                 "question": formatted_input,
                 "source": config["_dataset_source"],
-                "type": config["type"]
+                "type": config["type"],
+                "answer": answer,
+                "ground_truth": answer,
+                "correct_answer": correct_answer,
             }
             
             converted_data.append(unified_item)
@@ -286,6 +318,9 @@ def main():
         "question": [item["question"] for item in all_converted_data],
         'source': [item["source"] for item in all_converted_data],
         'type': [item["type"] for item in all_converted_data],
+        "answer": [item["answer"] for item in all_converted_data],
+        "ground_truth": [item["ground_truth"] for item in all_converted_data],
+        "correct_answer": [item["correct_answer"] for item in all_converted_data],
     })
     
     # Save the combined dataset with a generic name
@@ -296,7 +331,8 @@ def main():
 
     # Also save JSONL with the same base name next to the Arrow dataset directory
     output_base_name = os.path.basename(os.path.normpath(output_path))
-    output_parent_dir = os.path.dirname(os.path.normpath(output_path))
+    # output_parent_dir = os.path.dirname(os.path.normpath(output_path))
+    output_parent_dir = args.output_dir
     jsonl_path = os.path.join(output_parent_dir, f"{output_base_name}.jsonl")
     pd.DataFrame(
         {
@@ -304,6 +340,9 @@ def main():
             "question": [item["question"] for item in all_converted_data],
             "source": [item["source"] for item in all_converted_data],
             "type": [item["type"] for item in all_converted_data],
+            "answer": [item["answer"] for item in all_converted_data],
+            "ground_truth": [item["ground_truth"] for item in all_converted_data],
+            "correct_answer": [item["correct_answer"] for item in all_converted_data],
         }
     ).to_json(jsonl_path, orient="records", lines=True, force_ascii=False)
     print(f"Saved unified dataset JSONL with {len(unified_dataset)} items to {jsonl_path}")

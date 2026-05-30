@@ -20,6 +20,7 @@ import sglang as sgl
 from typing import Dict, Tuple, List
 import math
 import json
+from datasets import load_from_disk
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -164,8 +165,48 @@ def get_processed_data_ids_and_full_results(results_path):
         logger.warning(f"Could not read existing results file {results_path}: {e}")
         return set(), pd.DataFrame()
 
+def load_input_text_by_data_id(input_path: str) -> Dict[int, str]:
+    """Load Step 0 input_text values keyed by Step 1/2 data_id."""
+    llm_response_path = Path(input_path).parent.parent
+    dataset_finished_path = llm_response_path / "dataset_finished"
+    try:
+        if dataset_finished_path.exists():
+            dataset = load_from_disk(str(dataset_finished_path))
+            if hasattr(dataset, "keys"):
+                if "train" in dataset.keys():
+                    dataset = dataset["train"]
+                elif "test" in dataset.keys():
+                    dataset = dataset["test"]
+
+            input_text_by_data_id = {}
+            for data_id, sample in enumerate(dataset):
+                if "input_text" in sample:
+                    input_text_by_data_id[data_id] = sample["input_text"]
+                elif "question" in sample:
+                    input_text_by_data_id[data_id] = sample["question"]
+
+            logger.info(f"Loaded input_text for {len(input_text_by_data_id)} data samples from {dataset_finished_path}")
+            return input_text_by_data_id
+    except Exception as e:
+        logger.warning(f"Could not load input_text from {dataset_finished_path}: {e}")
+
+    csv_path = llm_response_path / "LLM_response_results.csv"
+    try:
+        if csv_path.exists():
+            df = pd.read_csv(csv_path)
+            if "input_text" in df.columns:
+                input_text_by_data_id = dict(enumerate(df["input_text"].tolist()))
+                logger.info(f"Loaded input_text for {len(input_text_by_data_id)} data samples from {csv_path}")
+                return input_text_by_data_id
+    except Exception as e:
+        logger.warning(f"Could not load input_text from {csv_path}: {e}")
+
+    logger.warning(f"Could not find input_text in {dataset_finished_path} or {csv_path}; Step 2 output will not include input_text.")
+    return {}
+
 def main():
     args = parse_args()
+    input_text_by_data_id = load_input_text_by_data_id(args.input_path)
 
     def normalize_path(path: str) -> Path:
         """Normalize path by replacing different mount prefixes for reliable comparison."""
@@ -457,6 +498,8 @@ def main():
         # Add data_id column if not present
         if 'data_id' not in data_df.columns:
             data_df['data_id'] = data_id
+        if input_text_by_data_id:
+            data_df['input_text'] = data_df['data_id'].map(input_text_by_data_id)
 
         # Handle first write in resume mode
         if not first_write_done:
@@ -479,6 +522,8 @@ def main():
 
     # Save final results
     results_df = data_points_to_df(comparison_points, mismatch_points_by_id, 'real', False)
+    if input_text_by_data_id and not results_df.empty:
+        results_df['input_text'] = results_df['data_id'].map(input_text_by_data_id)
     
     # In resume mode, combine existing results with new results
     if args.resume and not existing_results_df.empty:

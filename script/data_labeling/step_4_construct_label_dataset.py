@@ -79,8 +79,8 @@ final_max_token_id = args.final_max_token_id
 
 
 # Determine the column name to use in the dataset based on the divergent_column_name
-if 'divergent' in divergent_column_name:
-    dataset_column_name = 'divergent'
+if divergent_column_name in {'divergent', 'small_correct', 'reference_correct'}:
+    dataset_column_name = divergent_column_name
 else:
     raise NotImplementedError(f"Unknown divergent column name: {divergent_column_name}")
 
@@ -95,7 +95,7 @@ small_last_hidden_states_path = os.path.join(data_dir, "SLM_hidden_states.pt")
 
 def parse_data(output,divergent_column_name):
     output = str(output)
-    if 'divergent' in divergent_column_name:
+    if divergent_column_name in {'divergent', 'small_correct', 'reference_correct'}:
         if '1' in output:
             return 1
         elif '0' in output:
@@ -181,8 +181,12 @@ def align_data(divergent_df, data_index_df):
     Adjusts token_ids in divergent_df by subtracting 1 to match df_index.
     """
     print("Aligning data...")
-    # Keep only necessary columns from divergent df and adjust token_id
-    divergent_df_updated = divergent_df[['data_id', 'token_id', divergent_column_name]].copy()
+    # Keep label/correctness columns from verification df and adjust token_id.
+    merge_columns = ['data_id', 'token_id', divergent_column_name]
+    for optional_column in ['small_correct', 'reference_correct']:
+        if optional_column in divergent_df.columns and optional_column not in merge_columns:
+            merge_columns.append(optional_column)
+    divergent_df_updated = divergent_df[merge_columns].copy()
     divergent_df_updated['token_id'] = divergent_df_updated['token_id'] - 1  # Adjust token_id to match df_index
     
     # Convert divergent scores to numeric values
@@ -199,11 +203,16 @@ def align_data(divergent_df, data_index_df):
     )
     
     # Fill missing values based on the column type
-    if 'divergent' in divergent_column_name:
-        # For divergent column, fill missing values with 0 (not divergent)
-        merged_df[divergent_column_name] = merged_df[divergent_column_name].fillna(0)
+    if divergent_column_name in {'divergent', 'small_correct', 'reference_correct'}:
+        # For divergent labels, missing candidates are non-divergent. For correctness
+        # labels, missing candidates are unknown and should not be treated as wrong.
+        fill_value = 0 if divergent_column_name == 'divergent' else -1
+        merged_df[divergent_column_name] = merged_df[divergent_column_name].fillna(fill_value)
+        for optional_column in ['small_correct', 'reference_correct']:
+            if optional_column in merged_df.columns:
+                merged_df[optional_column] = merged_df[optional_column].fillna(-1)
         merged_df['mismatch'] = merged_df['mismatch'].fillna(0)
-        print(f"Data aligned. Tokens marked as divergent (1): {(merged_df[divergent_column_name] == 1).sum()}")
+        print(f"Data aligned. Tokens marked as {divergent_column_name}=1: {(merged_df[divergent_column_name] == 1).sum()}")
     else:
         raise NotImplementedError(f"Unknown divergent column name: {divergent_column_name}")
     
@@ -264,7 +273,7 @@ def create_dataset(batch_size=100000):
 
     # Define features for the dataset
 
-    features = Features({
+    feature_dict = {
         'token_id': Value('int64'),
         'data_id': Value('int64'),
         dataset_column_name: Value('int64'),
@@ -275,7 +284,11 @@ def create_dataset(batch_size=100000):
         'small_last_hidden_states': Sequence(feature=Value('float32')),
         'mismatch': Value('int64'),
         'mask': Value('int64'),
-    })
+    }
+    for optional_column in ['small_correct', 'reference_correct']:
+        if optional_column in aligned_df.columns and optional_column not in feature_dict:
+            feature_dict[optional_column] = Value('int64')
+    features = Features(feature_dict)
     
     # Calculate number of batches
     total_samples = len(aligned_df)
@@ -304,6 +317,9 @@ def create_dataset(batch_size=100000):
             'mismatch': aligned_df['mismatch'].iloc[start_idx:end_idx].tolist(),
             'mask': mask[start_idx:end_idx].tolist(),
         }
+        for optional_column in ['small_correct', 'reference_correct']:
+            if optional_column in aligned_df.columns and optional_column not in batch_dict:
+                batch_dict[optional_column] = aligned_df[optional_column].iloc[start_idx:end_idx].tolist()
         
         # Create dataset for this batch
         batch_dataset = Dataset.from_dict(batch_dict)
@@ -331,6 +347,9 @@ def create_dataset(batch_size=100000):
         'mismatch': aligned_df['mismatch'].tolist(),
         'mask': mask.tolist(),
     }
+    for optional_column in ['small_correct', 'reference_correct']:
+        if optional_column in aligned_df.columns and optional_column not in dataset_dict:
+            dataset_dict[optional_column] = aligned_df[optional_column].tolist()
     
     print(f"Dataset created with {len(dataset)} samples")
     return dataset, dataset_dict

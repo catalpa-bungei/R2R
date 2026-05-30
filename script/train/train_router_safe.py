@@ -1,5 +1,6 @@
 import os
 import glob
+import csv
 from pdb import runcall
 import sys
 import torch
@@ -7,6 +8,11 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_from_disk, load_dataset, concatenate_datasets, Value, Sequence
+try:
+    from datasets import disable_caching
+except ImportError:
+    def disable_caching():
+        return None
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
@@ -39,7 +45,7 @@ from r2r.train.optimizer import optimization_pipeline, standard_eval_pipeline
 
 DEFAULT_QWEN3_GUARD_MODEL_PATH = "/mnt/shared-storage-user/yangxuqing/models/Qwen3Guard-Stream-8B"
 TARGET_ROUTER_PAIR_NAME = "qwen3-32b+qwen3-4b-saferl"
-SAFE_RISK_INDEX = 0
+SAFE_RISK_INDEX = 0 # [safe, controversial, unsafe]
 
 
 def _extract_local_dataset_dirs(path_config: Union[str, List[str]]) -> List[str]:
@@ -110,6 +116,136 @@ def _collect_string_values(obj: Any) -> List[str]:
     return []
 
 
+def _resolve_tokenizer_name_or_path(data_config: Dict[str, Any], split_name: str) -> Optional[str]:
+    split_config = data_config.get(split_name, {}) if isinstance(data_config, dict) else {}
+    for key in ("tokenizer_name_or_path", "tokenizer_path", "tokenizer"):
+        value = split_config.get(key)
+        if value:
+            return value
+    for key in ("tokenizer_name_or_path", "tokenizer_path", "tokenizer"):
+        value = data_config.get(key) if isinstance(data_config, dict) else None
+        if value:
+            return value
+    return None
+
+
+def _load_token_decoder(tokenizer_name_or_path: str) -> AutoTokenizer:
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name_or_path, trust_remote_code=True, use_fast=True
+    )
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def _decode_token_id(tokenizer: AutoTokenizer, token_id: Any) -> str:
+    try:
+        return tokenizer.decode(
+            [int(token_id)],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except Exception:
+        return ""
+
+
+def _resolve_token_column(dataset, candidates: List[str]) -> Optional[str]:
+    for name in candidates:
+        if name in dataset.column_names:
+            return name
+    return None
+
+
+def _feature_dtype(feature: Any) -> Optional[str]:
+    if feature is None:
+        return None
+    if isinstance(feature, dict):
+        return feature.get("dtype")
+    return getattr(feature, "dtype", None)
+
+
+def _sequence_feature_dtype(feature: Any) -> Optional[str]:
+    if feature is None:
+        return None
+    nested_feature = feature.get("feature") if isinstance(feature, dict) else getattr(feature, "feature", None)
+    return _feature_dtype(nested_feature)
+
+
+def _column_matches_dtype(dataset, column: str, dtype: str, is_sequence: bool = False) -> bool:
+    if column not in dataset.column_names:
+        return False
+    feature = dataset.features.get(column)
+    if is_sequence:
+        return _sequence_feature_dtype(feature) == dtype
+    return _feature_dtype(feature) == dtype
+
+
+def _ensure_token_text_columns(
+    dataset,
+    split_name: str,
+    input_prefix: str,
+    tokenizer_name_or_path: Optional[str],
+):
+    if "small_text" in dataset.column_names and "real_text" in dataset.column_names:
+        return dataset
+
+    dataset.set_format(type=None)
+
+    if "small_text" not in dataset.column_names and "SLM_prediction_text" in dataset.column_names:
+        dataset = dataset.add_column("small_text", dataset["SLM_prediction_text"])
+    if "real_text" not in dataset.column_names and "real_token_text" in dataset.column_names:
+        dataset = dataset.add_column("real_text", dataset["real_token_text"])
+
+    if "small_text" in dataset.column_names and "real_text" in dataset.column_names:
+        return dataset
+
+    if not tokenizer_name_or_path:
+        raise ValueError(
+            f"Missing tokenizer_name_or_path for {split_name} split; "
+            "cannot decode token ids into small_text/real_text."
+        )
+
+    tokenizer = _load_token_decoder(tokenizer_name_or_path)
+
+    small_token_col = _resolve_token_column(
+        dataset,
+        ["small_token", f"{input_prefix}token", "SLM_predictions"],
+    )
+    real_token_col = _resolve_token_column(dataset, ["real_token"])
+
+    needs_small = "small_text" not in dataset.column_names
+    needs_real = "real_text" not in dataset.column_names
+
+    if needs_small and not small_token_col:
+        raise ValueError(
+            f"Cannot add small_text for {split_name}: missing small token column."
+        )
+    if needs_real and not real_token_col:
+        raise ValueError(
+            f"Cannot add real_text for {split_name}: missing real token column."
+        )
+
+    def _add_text_columns(batch):
+        outputs: Dict[str, List[str]] = {}
+        if needs_small:
+            outputs["small_text"] = [
+                _decode_token_id(tokenizer, token_id)
+                for token_id in batch[small_token_col]
+            ]
+        if needs_real:
+            outputs["real_text"] = [
+                _decode_token_id(tokenizer, token_id)
+                for token_id in batch[real_token_col]
+            ]
+        return outputs
+
+    return dataset.map(
+        _add_text_columns,
+        batched=True,
+        desc=f"Decoding tokens for {split_name}",
+    )
+
+
 def _should_enable_guard_safety_routing(config: Dict[str, Any]) -> bool:
     safety_router_config = config.get("safety_router", {})
     if "enabled" in safety_router_config:
@@ -128,11 +264,24 @@ def _build_guard_safety_config(config: Dict[str, Any]) -> Dict[str, Any]:
         return safety_router_config
 
     safety_router_config.setdefault("guard_model_path", DEFAULT_QWEN3_GUARD_MODEL_PATH)
-    safety_router_config.setdefault("safe_probability_threshold", 0.80)
-    safety_router_config.setdefault("route_label_column", "divergent")
+    safety_router_config.setdefault("safe_probability_threshold", 0.90)
+    safety_router_config.setdefault("route_label_column", "final_routing")
     safety_router_config.setdefault("score_column", "guard_safe_prob")
     safety_router_config.setdefault("force_column", "guard_force_saferl")
     safety_router_config.setdefault("response_token_column", "real_token")
+    safety_router_config.setdefault("force_combination", "or")
+    safety_router_config.setdefault("score_context", "conversation")
+    safety_router_config.setdefault("routing_logic", "threshold_or_label")
+    safety_router_config.setdefault("general_token_column", safety_router_config["response_token_column"])
+    safety_router_config.setdefault("safety_token_column", "real_token")
+    safety_router_config.setdefault("general_correct_column", "small_correct")
+    safety_router_config.setdefault("safety_correct_column", "reference_correct")
+    safety_router_config.setdefault("general_score_column", "general_guard_safe_prob")
+    safety_router_config.setdefault("safety_score_column", "safety_guard_safe_prob")
+    safety_router_config.setdefault("general_safe_column", "general_token_safe")
+    safety_router_config.setdefault("safety_safe_column", "safety_token_safe")
+    safety_router_config.setdefault("safe_dataset_output_name", "divergent_label_dataset_safe.csv")
+    safety_router_config.setdefault("save_safe_dataset", True)
     safety_router_config.setdefault(
         "source_dataset_relative_path",
         os.path.join("..", "..", "..", "dataset_finished"),
@@ -169,6 +318,8 @@ def _build_assistant_content(record: Dict[str, Any]) -> str:
 
 
 def _resolve_guard_source_dataset_path(dataset_path: Union[str, List[str]], relative_path: str) -> Optional[str]:
+    if not relative_path:
+        return None
     local_dataset_path = _normalize_local_dataset_path(dataset_path)
     if not local_dataset_path:
         return None
@@ -177,6 +328,81 @@ def _resolve_guard_source_dataset_path(dataset_path: Union[str, List[str]], rela
     if os.path.isdir(source_dataset_path):
         return source_dataset_path
     return None
+
+
+def _resolve_guard_safe_csv_output_path(
+    dataset_path: Union[str, List[str]],
+    output_name: str,
+) -> Optional[str]:
+    local_dataset_path = _normalize_local_dataset_path(dataset_path)
+    if not local_dataset_path:
+        return None
+    return os.path.join(os.path.abspath(local_dataset_path), output_name)
+
+
+def save_guard_safe_label_dataset(
+    dataset,
+    split_name: str,
+    dataset_path: Union[str, List[str]],
+    safety_router_config: Dict[str, Any],
+    label_column: str,
+) -> Optional[str]:
+    if not safety_router_config.get("save_safe_dataset", True):
+        return None
+
+    output_path = _resolve_guard_safe_csv_output_path(
+        dataset_path,
+        safety_router_config["safe_dataset_output_name"],
+    )
+    if not output_path:
+        print(f"Skipping safe dataset save for {split_name}: no local dataset path found.")
+        return None
+
+    score_column = safety_router_config["score_column"]
+    route_label_column = safety_router_config["route_label_column"]
+    final_routing_source_column = route_label_column if route_label_column in dataset.column_names else label_column
+
+    missing_columns = [
+        column
+        for column in (score_column, final_routing_source_column)
+        if column not in dataset.column_names
+    ]
+    if missing_columns:
+        raise ValueError(
+            f"Cannot save safe dataset for {split_name}; missing columns: {missing_columns}"
+        )
+
+    dataset.set_format(type=None)
+    scalar_columns = []
+    if len(dataset) > 0:
+        sample = dataset[0]
+        for column in dataset.column_names:
+            value = sample[column]
+            if isinstance(value, (list, tuple, dict)):
+                continue
+            scalar_columns.append(column)
+    else:
+        scalar_columns = dataset.column_names
+
+    fieldnames = [
+        column
+        for column in scalar_columns
+        if column not in {"safe_score", "final_routing"}
+    ]
+    fieldnames.extend(["safe_score", "final_routing"])
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in dataset:
+            csv_row = {column: row[column] for column in fieldnames if column in row}
+            csv_row["safe_score"] = float(row[score_column])
+            csv_row["final_routing"] = int(row[final_routing_source_column])
+            writer.writerow(csv_row)
+
+    print(f"Safe divergent label CSV for {split_name} saved to {output_path}")
+    return output_path
 
 
 def _load_guard_source_records(dataset_path: Union[str, List[str]], relative_path: str) -> tuple[Dict[int, Dict[str, str]], Optional[str]]:
@@ -294,18 +520,45 @@ def annotate_dataset_with_guard_scores(
     score_column = safety_router_config["score_column"]
     force_column = safety_router_config["force_column"]
     route_label_column = safety_router_config["route_label_column"]
+    routing_logic = safety_router_config.get("routing_logic", "threshold_or_label")
+    if route_label_column == label_column:
+        route_label_column = "final_routing"
+        safety_router_config["route_label_column"] = route_label_column
     safe_probability_threshold = float(safety_router_config["safe_probability_threshold"])
     response_token_column = safety_router_config["response_token_column"]
+    force_combination = safety_router_config.get("force_combination", "or")
+    if force_combination not in {"or", "and", "four_signal"}:
+        raise ValueError(f"Unknown guard force_combination: {force_combination}")
+    score_context = safety_router_config.get("score_context", "conversation")
 
     if (
+        routing_logic == "four_signal"
+        and not safety_router_config.get("recompute", False)
+        and route_label_column in dataset.column_names
+        and safety_router_config["general_score_column"] in dataset.column_names
+        and safety_router_config["safety_score_column"] in dataset.column_names
+    ):
+        print(f"Four-signal safety routing already exists for {split_name}; reusing cached columns.")
+        return dataset
+
+    if (
+        routing_logic != "four_signal"
+        and
         not safety_router_config.get("recompute", False)
         and score_column in dataset.column_names
         and force_column in dataset.column_names
     ):
         print(f"Guard safety annotation already exists for {split_name}; reusing cached columns.")
-        if route_label_column == label_column:
-            cached_force_count = int(sum(int(x) for x in dataset[force_column]))
-            print(f"Cached guard-forced SafeRL routes in {split_name}: {cached_force_count}")
+        cached_force_flags = [int(x) for x in dataset[force_column]]
+        if route_label_column not in dataset.column_names:
+            dataset.set_format(type=None)
+            cached_labels = [
+                int((label == 1 and force_flag == 1) if force_combination == "and" else (label == 1 or force_flag == 1))
+                for label, force_flag in zip(dataset[label_column], cached_force_flags)
+            ]
+            dataset = dataset.add_column(route_label_column, cached_labels)
+        cached_force_count = int(sum(cached_force_flags))
+        print(f"Cached guard-forced SafeRL routes in {split_name}: {cached_force_count}")
         return dataset
 
     if "data_id" not in dataset.column_names or response_token_column not in dataset.column_names:
@@ -316,7 +569,7 @@ def annotate_dataset_with_guard_scores(
 
     source_records, source_dataset_path = _load_guard_source_records(
         dataset_path=dataset_path,
-        relative_path=safety_router_config["source_dataset_relative_path"],
+        relative_path=safety_router_config["source_dataset_relative_path"] if score_context == "conversation" else "",
     )
     if source_dataset_path:
         print(f"Loaded guard source dataset for {split_name} from: {source_dataset_path}")
@@ -338,51 +591,139 @@ def annotate_dataset_with_guard_scores(
     existing_labels = [int(x) for x in dataset[label_column]]
 
     sorted_indices = sorted(range(num_rows), key=lambda idx: (data_ids[idx], token_positions[idx]))
-    safe_probs_by_index = [1.0] * num_rows
     alignment_counter: Counter = Counter()
 
-    current_group_indices: List[int] = []
-    current_data_id: Optional[int] = None
+    def score_dataset_token_column(token_column: str, use_source_context: bool, desc_suffix: str) -> List[float]:
+        token_values_for_column = [int(x) for x in dataset[token_column]]
+        safe_probs_by_index = [1.0] * num_rows
+        current_group_indices: List[int] = []
+        current_data_id: Optional[int] = None
 
-    def flush_group() -> None:
-        if not current_group_indices:
-            return
+        def flush_group() -> None:
+            if not current_group_indices:
+                return
 
-        group_data_id = data_ids[current_group_indices[0]]
-        group_tokens = [token_values[idx] for idx in current_group_indices]
-        group_safe_probs, alignment_mode = annotator.score_token_group(
-            token_ids=group_tokens,
-            source_record=source_records.get(group_data_id),
-        )
-        alignment_counter[alignment_mode] += 1
-
-        if len(group_safe_probs) != len(current_group_indices):
-            raise ValueError(
-                f"Guard scorer returned {len(group_safe_probs)} scores for data_id={group_data_id}, "
-                f"expected {len(current_group_indices)}"
+            group_data_id = data_ids[current_group_indices[0]]
+            group_tokens = [token_values_for_column[idx] for idx in current_group_indices]
+            group_safe_probs, alignment_mode = annotator.score_token_group(
+                token_ids=group_tokens,
+                source_record=source_records.get(group_data_id) if use_source_context else None,
             )
+            alignment_counter[f"{token_column}:{alignment_mode}"] += 1
 
-        for row_idx, safe_prob in zip(current_group_indices, group_safe_probs):
-            safe_probs_by_index[row_idx] = float(safe_prob)
+            if len(group_safe_probs) != len(current_group_indices):
+                raise ValueError(
+                    f"Guard scorer returned {len(group_safe_probs)} scores for data_id={group_data_id}, "
+                    f"expected {len(current_group_indices)}"
+                )
 
-    for row_idx in tqdm(sorted_indices, desc=f"Guard safety scoring ({split_name})"):
-        row_data_id = data_ids[row_idx]
-        if current_data_id is None:
-            current_data_id = row_data_id
-        if row_data_id != current_data_id:
-            flush_group()
-            current_group_indices = []
-            current_data_id = row_data_id
-        current_group_indices.append(row_idx)
+            for row_idx, safe_prob in zip(current_group_indices, group_safe_probs):
+                safe_probs_by_index[row_idx] = float(safe_prob)
 
-    flush_group()
+        for row_idx in tqdm(sorted_indices, desc=f"Guard safety scoring {desc_suffix} ({split_name})"):
+            row_data_id = data_ids[row_idx]
+            if current_data_id is None:
+                current_data_id = row_data_id
+            if row_data_id != current_data_id:
+                flush_group()
+                current_group_indices = []
+                current_data_id = row_data_id
+            current_group_indices.append(row_idx)
+
+        flush_group()
+        return safe_probs_by_index
+
+    if routing_logic == "four_signal":
+        general_token_column = safety_router_config["general_token_column"]
+        safety_token_column = safety_router_config["safety_token_column"]
+        general_correct_column = safety_router_config["general_correct_column"]
+        safety_correct_column = safety_router_config["safety_correct_column"]
+        general_score_column = safety_router_config["general_score_column"]
+        safety_score_column = safety_router_config["safety_score_column"]
+        general_safe_column = safety_router_config["general_safe_column"]
+        safety_safe_column = safety_router_config["safety_safe_column"]
+
+        missing_columns = [
+            column
+            for column in [
+                general_token_column,
+                safety_token_column,
+                general_correct_column,
+                safety_correct_column,
+            ]
+            if column not in dataset.column_names
+        ]
+        if missing_columns:
+            raise ValueError(f"Four-signal safety routing requires missing columns: {missing_columns}")
+
+        general_safe_probs = score_dataset_token_column(general_token_column, False, "general token")
+        safety_safe_probs = score_dataset_token_column(safety_token_column, score_context == "conversation", "safety token")
+
+        general_safe_flags = [
+            int(mask != 1 or safe_prob >= safe_probability_threshold)
+            for safe_prob, mask in zip(general_safe_probs, mask_values)
+        ]
+        safety_safe_flags = [
+            int(safe_prob >= safe_probability_threshold)
+            for safe_prob in safety_safe_probs
+        ]
+        general_correct_values = [int(x) for x in dataset[general_correct_column]]
+        safety_correct_values = [int(x) for x in dataset[safety_correct_column]]
+
+        final_labels = []
+        for mask, general_safe, general_correct, safety_safe, safety_correct in zip(
+            mask_values,
+            general_safe_flags,
+            general_correct_values,
+            safety_safe_flags,
+            safety_correct_values,
+        ):
+            if mask != 1 or general_safe == 1:
+                final_labels.append(0)
+            elif general_correct == 0:
+                final_labels.append(1)
+            elif general_correct == 1 and safety_safe == 1 and safety_correct == 1:
+                final_labels.append(1)
+            elif general_correct in [0, 1] and safety_correct in [0, 1]:
+                final_labels.append(0)
+            else:
+                final_labels.append(-1)
+
+        for column in [
+            general_score_column,
+            safety_score_column,
+            general_safe_column,
+            safety_safe_column,
+            force_column,
+            route_label_column,
+        ]:
+            if column in dataset.column_names:
+                dataset = dataset.remove_columns(column)
+
+        dataset = dataset.add_column(general_score_column, general_safe_probs)
+        dataset = dataset.add_column(safety_score_column, safety_safe_probs)
+        dataset = dataset.add_column(general_safe_column, general_safe_flags)
+        dataset = dataset.add_column(safety_safe_column, safety_safe_flags)
+        dataset = dataset.add_column(force_column, [int(label == 1) for label in final_labels])
+        dataset = dataset.add_column(route_label_column, final_labels)
+
+        print(
+            f"Four-signal safety routing applied to {split_name}: "
+            f"general_safe={sum(general_safe_flags)}/{num_rows}; "
+            f"safety_safe={sum(safety_safe_flags)}/{num_rows}; "
+            f"route_to_safe={sum(1 for label in final_labels if label == 1)}."
+        )
+        print(f"Guard alignment modes for {split_name}: {dict(alignment_counter)}")
+        return dataset
+
+    safe_probs_by_index = score_dataset_token_column(response_token_column, score_context == "conversation", response_token_column)
 
     guard_force_flags = [
         int(mask == 1 and safe_prob < safe_probability_threshold)
         for safe_prob, mask in zip(safe_probs_by_index, mask_values)
     ]
     forced_labels = [
-        int(label == 1 or force_flag == 1)
+        int((label == 1 and force_flag == 1) if force_combination == "and" else (label == 1 or force_flag == 1))
         for label, force_flag in zip(existing_labels, guard_force_flags)
     ]
 
@@ -390,23 +731,19 @@ def annotate_dataset_with_guard_scores(
         dataset = dataset.remove_columns(score_column)
     if force_column in dataset.column_names:
         dataset = dataset.remove_columns(force_column)
-    if route_label_column in dataset.column_names and route_label_column != label_column:
+    if route_label_column in dataset.column_names:
         dataset = dataset.remove_columns(route_label_column)
 
     dataset = dataset.add_column(score_column, safe_probs_by_index)
     dataset = dataset.add_column(force_column, guard_force_flags)
-
-    if route_label_column == label_column:
-        dataset = dataset.remove_columns(label_column)
-        dataset = dataset.add_column(label_column, forced_labels)
-    else:
-        dataset = dataset.add_column(route_label_column, forced_labels)
+    dataset = dataset.add_column(route_label_column, forced_labels)
 
     forced_count = int(sum(guard_force_flags))
     original_positive_count = int(sum(existing_labels))
     updated_positive_count = int(sum(forced_labels))
     print(
         f"Guard safety routing applied to {split_name}: "
+        f"combination={force_combination}; scored {response_token_column}; "
         f"forced {forced_count} tokens below safe_prob<{safe_probability_threshold:.2f}; "
         f"positive labels {original_positive_count} -> {updated_positive_count}."
     )
@@ -841,15 +1178,30 @@ class InputLabelDataset(Dataset):
         ]
 
         # One-time type casting so tensors are already in the correct dtype
-        self.dataset = self.dataset.cast_column(self.label_column, Value("int64"))
-        self.dataset = self.dataset.cast_column("mismatch", Value("int64"))
-        self.dataset = self.dataset.cast_column("mask", Value("int64"))
+        if not _column_matches_dtype(self.dataset, self.label_column, "int64"):
+            self.dataset = self.dataset.cast_column(self.label_column, Value("int64"))
+        if not _column_matches_dtype(self.dataset, "mismatch", "int64"):
+            self.dataset = self.dataset.cast_column("mismatch", Value("int64"))
+        if not _column_matches_dtype(self.dataset, "mask", "int64"):
+            self.dataset = self.dataset.cast_column("mask", Value("int64"))
 
-        if self.use_logits and self.logits_col in self.dataset.column_names:
+        if (
+            self.use_logits
+            and self.logits_col in self.dataset.column_names
+            and not _column_matches_dtype(self.dataset, self.logits_col, "float32", is_sequence=True)
+        ):
             self.dataset = self.dataset.cast_column(self.logits_col, Sequence(Value("float32")))
-        if self.use_hidden_states and self.hidden_states_col in self.dataset.column_names:
+        if (
+            self.use_hidden_states
+            and self.hidden_states_col in self.dataset.column_names
+            and not _column_matches_dtype(self.dataset, self.hidden_states_col, "float32", is_sequence=True)
+        ):
             self.dataset = self.dataset.cast_column(self.hidden_states_col, Sequence(Value("float32")))
-        if self.use_token and self.token_col in self.dataset.column_names:
+        if (
+            self.use_token
+            and self.token_col in self.dataset.column_names
+            and not _column_matches_dtype(self.dataset, self.token_col, "int64")
+        ):
             self.dataset = self.dataset.cast_column(self.token_col, Value("int64"))
 
         # Convert dataset to PyTorch tensors
@@ -951,6 +1303,10 @@ def parse_args():
 
 def main(config: dict, use_wandb: bool = False, validate_model_path: Optional[str] = None):
     """Main function to train and evaluate the model."""
+    # Prevent HuggingFace Datasets from writing persistent cache-*.arrow files
+    # into the source dataset directory during training-only transformations.
+    disable_caching()
+
     # Initialize wandb if requested
     if use_wandb:
         # Initialize wandb with the config
@@ -1047,6 +1403,15 @@ def main(config: dict, use_wandb: bool = False, validate_model_path: Optional[st
     datasets = {"train": train_dataset, "test": test_dataset}
     input_prefixes = {"train": train_input_prefix, "test": test_input_prefix}
 
+    for split, dataset in datasets.items():
+        tokenizer_name_or_path = _resolve_tokenizer_name_or_path(data_config, split)
+        datasets[split] = _ensure_token_text_columns(
+            dataset=dataset,
+            split_name=split,
+            input_prefix=input_prefixes[split],
+            tokenizer_name_or_path=tokenizer_name_or_path,
+        )
+
     # process and filter datasets
     for split, dataset in datasets.items():
         # ensure divergent column exists
@@ -1132,7 +1497,10 @@ def main(config: dict, use_wandb: bool = False, validate_model_path: Optional[st
             before = len(datasets[split])
             # Reset format to avoid torch tensors in filter
             datasets[split].set_format(type=None)
-            datasets[split] = datasets[split].filter(lambda ex: ex["mask"] == 1 and ex["divergent"] in [0, 1], num_proc=32)
+            if label_column in datasets[split].column_names:
+                datasets[split] = datasets[split].filter(lambda ex: ex["mask"] == 1 and ex[label_column] in [0, 1], num_proc=32)
+            else:
+                datasets[split] = datasets[split].filter(lambda ex: ex["mask"] == 1, num_proc=32)
             after = len(datasets[split])
             print(f"Filtered {split} dataset by mask: {before} -> {after}")
 
@@ -1168,6 +1536,37 @@ def main(config: dict, use_wandb: bool = False, validate_model_path: Optional[st
             label_column=label_column,
         )
         label_column = safety_router_config["route_label_column"]
+        train_safe_output_path = _resolve_guard_safe_csv_output_path(
+            data_config["train"]["path"],
+            safety_router_config["safe_dataset_output_name"],
+        )
+        test_safe_output_path = _resolve_guard_safe_csv_output_path(
+            test_dataset_path_for_guard,
+            safety_router_config["safe_dataset_output_name"],
+        )
+        if train_safe_output_path and train_safe_output_path == test_safe_output_path:
+            save_guard_safe_label_dataset(
+                dataset=concatenate_datasets([datasets["train"], datasets["test"]]),
+                split_name="train+test",
+                dataset_path=data_config["train"]["path"],
+                safety_router_config=safety_router_config,
+                label_column=label_column,
+            )
+        else:
+            save_guard_safe_label_dataset(
+                dataset=datasets["train"],
+                split_name="train",
+                dataset_path=data_config["train"]["path"],
+                safety_router_config=safety_router_config,
+                label_column=label_column,
+            )
+            save_guard_safe_label_dataset(
+                dataset=datasets["test"],
+                split_name="test",
+                dataset_path=test_dataset_path_for_guard,
+                safety_router_config=safety_router_config,
+                label_column=label_column,
+            )
 
     # Clean stale cache shards created by prior runs while preserving currently referenced files.
     _cleanup_stale_hf_cache_files(

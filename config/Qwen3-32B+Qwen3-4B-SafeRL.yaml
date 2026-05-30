@@ -7,13 +7,14 @@
     "model_name": "Qwen3-32B",
     "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137",
     "param": "32",
-    "mem_fraction_static": 0.80
+    "mem_fraction_static": 0.15
   },
   "reference": {
     "model_name": "Qwen3-4B-SafeRL",
     "model_path": "/mnt/shared-storage-user/yangxuqing/models/Qwen3-4B-SafeRL",
     "param": "4",
-    "mem_fraction_static": 0.30
+    "mem_fraction_static": 0.30,
+    "restart_interval": 1000
   },
   "continuation_main": {
     "model_name": "Qwen3-4B-SafeRL",
@@ -45,7 +46,7 @@
   "router": {
     "router_name": "Qwen3-32B+Qwen3-4B-SafeRL",
     "router_path": "/mnt/shared-storage-user/yangxuqing/R2R/Routers/R2R_router/default_router.pt",
-    "switching_strategy": "random",
+    "switching_strategy": "neural",
     "override_init_args": {
       "pretrained_model_name": "/mnt/shared-storage-user/yangxuqing/models/Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137"
     }

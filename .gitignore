@@ -38,3 +38,6 @@ runs/*
 evaluate/*
 R2R/eval_output
 **router/*
+**R2R_router/**
+**.backup
+download_hf.py

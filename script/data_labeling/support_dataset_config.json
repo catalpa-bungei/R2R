@@ -26,7 +26,7 @@
     "gpqa_extended": {
         "dataset_path": "/mnt/shared-storage-user/yangxuqing/GPQA/gpqa/gpqa_extended.csv",
         "dataset_subset": "gpqa_extended",
-        "id_field": "id",
+        "id_field": "Record ID",
         "message_format": [
             {
                 "role": "user",
@@ -103,6 +103,24 @@
         ],
         "add_generation_prompt": true,
         "type": "Safety"
+    },
+    "gpqa_diamond": {
+        "dataset_path": "/mnt/shared-storage-user/yangxuqing/GPQA/gpqa/gpqa_diamond.csv",
+        "dataset_subset": "gpqa_extended",
+        "id_field": "Record ID",
+        "message_format": [
+            {
+                "role": "user",
+                "content_field": "Question"
+            }
+        ],
+        "query_format":{
+            "query_type":"multiple_choice",
+            "question_field":"Question",
+            "options_fields":["Correct Answer", "Incorrect Answer 1", "Incorrect Answer 2", "Incorrect Answer 3"]
+        },
+        "add_generation_prompt": true,
+        "type": "QA"
     },
     "R2R_dataset":{
         "id_field": "id",

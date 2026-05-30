@@ -68,10 +68,18 @@ Unified fields produced here include:
 - `original_data`
 - `source`
 - `type`
+- `answer`
+- `ground_truth`
+- `correct_answer`
 
 Why this exists:
 
 - different benchmarks store prompts, answers, and splits differently, so the rest of the pipeline expects one consistent format
+
+Multiple-choice policy:
+
+- During training-data initialization, multiple-choice options may be shuffled by `prepare_multiple_choice_prompt(...)`; the shuffled correct option letter is saved as both `answer` and `ground_truth`, and the original correct answer text is saved as `correct_answer`.
+- During evaluation, `script/evaluate/hf_dataset_sglang_local.py` does not shuffle options; its shuffle line is intentionally disabled, so raw GPQA-style CSV evaluation keeps the configured option order.
 
 ## Stage 2: Generate Reference LLM Responses
 
@@ -107,7 +115,7 @@ Other outputs:
 Fields in the finished dataset commonly include:
 
 - `id`
-- `input_text` or `question`
+- `input_text`
 - `model_reasoning`
 - `model_response`
 - `is_finished`
@@ -190,11 +198,12 @@ Important columns in that CSV:
 
 - `data_id`
 - `token_id`
+- `input_text`
 - `small_diverge_text`
 - `reference_diverge_text`
 - `common_context`
 
-Each row corresponds to a mismatch candidate. The `small_diverge_text` branch uses the SLM-predicted token at the mismatch point, while the `reference_diverge_text` branch follows the original reference token path.
+Each row corresponds to a mismatch candidate. The `input_text` column is the original question/prompt text from Step 0. Step 2 first reads it from the Step 0 `dataset_finished` dataset and can fall back to `LLM_response_results.csv`, which also contains `input_text`. The `small_diverge_text` branch uses the SLM-predicted token at the mismatch point, while the `reference_diverge_text` branch follows the original reference token path.
 
 ## Stage 5: Verify Whether The Divergence Is Real
 
@@ -228,6 +237,67 @@ The verification label should be read as:
 
 - `divergent = 1`: the SLM-induced branch is meaningfully different, so the router should learn to escalate at this token.
 - `divergent = 0`: the token mismatch did not produce a meaningful divergence.
+
+### Optional Accuracy Verification Variant
+
+There is also an accuracy-oriented Step 3 variant:
+
+- `script/data_labeling/step_3_verify_acc.py`
+- `r2r/data/verify_model_acc.py`
+
+This variant does not ask the verifier to compare the two continuations against each other. Instead, it asks whether each continuation is solution-useful and correct independently for the original question and reasoning context. A locally true but irrelevant or vacuous sentence should not receive a positive label.
+
+Inputs required in the CSV:
+
+- `small_diverge_text`
+- `reference_diverge_text`
+- `common_context`
+
+Optional input columns:
+
+- `input_text`
+- `question`
+- `prompt`
+
+The normal key produced by the current Step 0 -> Step 2 pipeline is `input_text`. `question` and `prompt` are accepted as fallbacks for manually prepared CSVs. The verifier prompt then judges each continuation against the original question/prompt plus the shared reasoning context.
+
+Outputs:
+
+- a new CSV that appends
+  - `small_correct`
+  - `reference_correct`
+  - `verify_response`
+
+By default, this script writes:
+
+- `generation_results_data_all_real_full_verify_acc.csv`
+
+The accuracy labels should be read as solution-usefulness labels:
+
+- `small_correct = 1`: the SLM-induced continuation is locally valid and helps preserve or advance a path toward the final answer.
+- `small_correct = 0`: the SLM-induced continuation is wrong, unsupported, contradictory, irrelevant, vacuous, or otherwise not useful for reaching the final answer.
+- `reference_correct = 1`: the reference continuation is locally valid and helps preserve or advance a path toward the final answer.
+- `reference_correct = 0`: the reference continuation is wrong, unsupported, contradictory, irrelevant, vacuous, or otherwise not useful for reaching the final answer.
+
+For safety-threshold routing, these two correctness signals are kept through Step 4 and combined during `train_router_safe.py` with two Qwen3Guard safety signals:
+
+- `general_token_safe`: whether the general/SLM token is safe according to Qwen3Guard.
+- `small_correct`: whether the general/SLM continuation is solution-useful and correct.
+- `safety_token_safe`: whether the SafeRL/reference token is safe according to Qwen3Guard.
+- `reference_correct`: whether the SafeRL/reference continuation is solution-useful and correct.
+
+In the four-signal mode, `train_router_safe.py` writes these columns alongside `final_routing`. The decision rule is:
+
+```text
+route_to_safe = general_token_unsafe AND (general_wrong OR (safety_token_safe AND safety_model_correct))
+```
+
+This implements the routing table:
+
+- safe general token -> route to the general model
+- unsafe + correct general token, safe + correct safety-model token -> route to the safety model
+- unsafe + correct general token, safe + incorrect safety-model token -> route to the general model
+- unsafe + incorrect general token -> route to the safety model
 
 ## Stage 6: Build The Final Training Dataset
 
@@ -304,6 +374,13 @@ Typical outputs:
 - router checkpoint in `resource/`
 - training checkpoints in `output/checkpoint_*`
 
+Router checkpoint artifact types:
+
+- `output/checkpoint_*/checkpoint_best_all.pt` is the best-epoch training checkpoint. It is still a router checkpoint, but it is saved during training and includes the router weights, copied source-model token embeddings when the architecture uses them, optimizer state, epoch, and validation metrics. Its threshold is the checkpoint default, commonly `0.5`.
+- `resource/default_router_*/classifier_*_all.pt` is the exported/final router checkpoint intended for use by runtime configs. It contains the router weights and copied source-model token embeddings, but omits optimizer state and epoch/validation checkpoint metadata. It is written after validation and threshold optimization, so its saved threshold is the optimized routing threshold.
+
+For the `Qwen3-32B+Qwen3-4B-SafeRL` setup, both artifacts use the router architecture `HiddenStatesTokenLMHeadLogitsClassifier`. The source model for router hidden-state dimensions and copied token embeddings is `Qwen3-32B`; the saved artifact is not the full Qwen3-32B transformer model.
+
 ## Safe Router Training With Qwen3Guard-Stream
 
 `script/train/train_router_safe.py` extends the normal router training path with an optional Qwen3Guard-Stream safety constraint. It is designed for the `Qwen3-32B+Qwen3-4B-SafeRL` pair.
@@ -316,12 +393,23 @@ Triggering logic:
 Default safety config values:
 
 - `guard_model_path`: `/mnt/shared-storage-user/yangxuqing/models/Qwen3Guard-Stream-8B`
-- `safe_probability_threshold`: `0.80`
+- `safe_probability_threshold`: `0.90`
 - `score_column`: `guard_safe_prob`
 - `force_column`: `guard_force_saferl`
-- `route_label_column`: `divergent`
+- `route_label_column`: `final_routing`
 - `response_token_column`: `real_token`
+- `force_combination`: `or`
+- `score_context`: `conversation`
 - `source_dataset_relative_path`: `../../../dataset_finished`
+
+The Qwen3-32B + Qwen3-4B-SafeRL accuracy-routing config overrides these defaults with:
+
+- `route_label_column`: `divergent`
+- `response_token_column`: `small_token`
+- `force_combination`: `and`
+- `score_context`: `token_only`
+
+These overrides make the guard score the general model token and apply the routing table above.
 
 ### What Qwen3Guard-Stream Scores
 
@@ -465,6 +553,30 @@ The `trial.sh` examples show how the same benchmark can be run with different co
 
 One practical detail from `trial.sh` is that `model_configs.json` must match the model pair being labeled. If it points to the wrong `quick` or `reference` model, Step 2 and Step 3 can use inconsistent metadata.
 
+### Tokenizer Compatibility For `Qwen3-32B+Qwen3-4B-SafeRL`
+
+For the `Qwen3-32B+Qwen3-4B-SafeRL` setup, both models use the same Qwen3 tokenizer space, which is required by `DynamicSimpleSGLangSelector`.
+
+Verified local paths:
+
+- `models/Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137`
+- `models/Qwen3-4B-SafeRL`
+
+Verified tokenizer facts:
+
+- `vocab_size = 151936` for both models
+- `bos_token_id = 151643`
+- `eos_token_id = 151645` corresponding to `<|im_end|>`
+- `pad_token = <|endoftext|>`
+- `<think> = 151667`
+- `</think> = 151668`
+
+This means the config entry
+
+- `"special_tokens": { "think_start": 151667, "think_end": 151668 }`
+
+is correct for this pair and does not need to be overridden.
+
 ## Typical Artifact Flow
 
 The end-to-end artifact chain in `trial.sh` is:
@@ -479,6 +591,7 @@ The end-to-end artifact chain in `trial.sh` is:
    - `.../LLM_continuation_verify/generation_results_data_all_real_full.csv`
 5. `step_3_verify.py`
    - `.../generation_results_data_all_real_full_verify.csv`
+   - optional accuracy variant: `step_3_verify_acc.py` writes `.../generation_results_data_all_real_full_verify_acc.csv`
 6. `step_4_construct_label_dataset.py`
    - `.../divergent_label_dataset/`
 7. `train_router.py`
