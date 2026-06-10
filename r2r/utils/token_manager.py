@@ -9,26 +9,41 @@ class SGLangTokenManager:
     """
     
     def __init__(
-        self, 
-        input_ids: List[List[int]], 
-        tokenizer: PreTrainedTokenizer, 
+        self,
+        input_ids: List[List[int]],
+        tokenizer: PreTrainedTokenizer,
         max_new_tokens: int = 128,
         record_hidden_states: bool = False,
-        record_token_type: bool = False
+        record_token_type: bool = False,
+        eos_token_ids: Optional[Union[int, List[int]]] = None,
     ) -> None:
         """
         Initialize the TokenManager with tokenized inputs.
-        
+
         Args:
             input_ids (List[List[int]]): List of tokenized inputs
             tokenizer (PreTrainedTokenizer): Tokenizer for decoding
             max_new_tokens (int): Maximum number of tokens to generate
             record_hidden_states (bool): Whether to record hidden states during generation
             record_token_type (bool): Whether to record which model generated each token
+            eos_token_ids (Optional[Union[int, List[int]]]): Terminal token id(s) that end a
+                sequence. Must match the generating scheduler's EOS set, otherwise the active
+                sequence count can desync from the decode batch. Defaults to the tokenizer's
+                single eos_token_id.
         """
         self.input_ids = input_ids
         self.tokenizer = tokenizer
         self.eos_token_id = tokenizer.eos_token_id
+        # Build the set of terminal token ids. Match the scheduler's EOS set (which for
+        # models like Qwen3 includes both <|im_end|> and <|endoftext|>) so that a sequence
+        # finishes here on the same step the scheduler drops it from the decode batch.
+        self.eos_token_ids = set()
+        if eos_token_ids is not None:
+            if isinstance(eos_token_ids, int):
+                eos_token_ids = [eos_token_ids]
+            self.eos_token_ids.update(int(t) for t in eos_token_ids if t is not None)
+        if self.eos_token_id is not None:
+            self.eos_token_ids.add(int(self.eos_token_id))
         self.max_new_tokens = max_new_tokens
         self.record_hidden_states = record_hidden_states
         self.record_token_type = record_token_type
@@ -89,6 +104,16 @@ class SGLangTokenManager:
         Fetch active input ids for given indices.
         """
         return [self.active_input_ids[i] for i in index]
+
+    def fetch_active_input_ids_by_original_index(self, original_indices: List[int]) -> List[List[int]]:
+        """
+        Fetch active input ids for given original batch indices.
+        """
+        original_to_ids = {
+            seq["original_index"]: ids
+            for seq, ids in zip(self.active_sequences, self.active_input_ids)
+        }
+        return [original_to_ids[i] for i in original_indices]
     
     def update_sequences_engine(self, outputs: List[Dict[str, Any]]) -> bool:
         """
@@ -146,7 +171,7 @@ class SGLangTokenManager:
             seq["current_ids"].append(generated_token)
             
             # Check if EOS token or reached max tokens
-            if generated_token == self.eos_token_id or len(seq["output_ids"]) >= self.max_new_tokens:
+            if generated_token in self.eos_token_ids or len(seq["output_ids"]) >= self.max_new_tokens:
                 seq["is_finished"] = True
                 self.finished_sequences.append(seq)
                 indices_to_remove.append(i)
@@ -158,6 +183,63 @@ class SGLangTokenManager:
             self.active_sequences = [seq for i, seq in enumerate(self.active_sequences) if i not in indices_to_remove]
             self.active_input_ids = [ids for i, ids in enumerate(self.active_input_ids) if i not in indices_to_remove]
             
+        return any_finished
+
+    def update_sequences_by_original_index(
+        self,
+        original_indices: List[int],
+        generated_tokens: List[int],
+        hidden_states: List[torch.Tensor] | None = None,
+        token_types: List[int] | None = None,
+    ) -> bool:
+        """
+        Update only the active sequences identified by their original batch indices.
+        This is needed when the SGLang scheduler admits a subset of the requested batch.
+        """
+        if not (
+            len(original_indices) == len(generated_tokens)
+            and (hidden_states is None or len(hidden_states) == len(original_indices))
+            and (token_types is None or len(token_types) == len(original_indices))
+        ):
+            raise ValueError("original_indices, generated_tokens, hidden_states, and token_types must have matching lengths")
+
+        original_to_payload = {}
+        for i, original_index in enumerate(original_indices):
+            original_to_payload[original_index] = (
+                generated_tokens[i],
+                hidden_states[i] if hidden_states is not None else None,
+                token_types[i] if token_types is not None else None,
+            )
+
+        any_finished = False
+        indices_to_remove = []
+
+        for i, seq in enumerate(self.active_sequences):
+            payload = original_to_payload.get(seq["original_index"])
+            if payload is None:
+                continue
+
+            generated_token, hidden_state, token_type = payload
+
+            if self.record_hidden_states and hidden_state is not None:
+                seq["hidden_states"].append(hidden_state)
+
+            if self.record_token_type and token_type is not None:
+                seq["token_types"].append(token_type)
+
+            seq["output_ids"].append(generated_token)
+            seq["current_ids"].append(generated_token)
+
+            if generated_token in self.eos_token_ids or len(seq["output_ids"]) >= self.max_new_tokens:
+                seq["is_finished"] = True
+                self.finished_sequences.append(seq)
+                indices_to_remove.append(i)
+                any_finished = True
+
+        if indices_to_remove:
+            self.active_sequences = [seq for i, seq in enumerate(self.active_sequences) if i not in indices_to_remove]
+            self.active_input_ids = [ids for i, ids in enumerate(self.active_input_ids) if i not in indices_to_remove]
+
         return any_finished
     
     def is_generation_complete(self) -> bool:

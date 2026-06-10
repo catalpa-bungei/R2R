@@ -76,10 +76,10 @@ class DynamicSimpleSGLangSelector:
         # Currently only support tp_size=1 for quick model
         quick_sglang_kwargs["tp_size"] = 1
         reference_sglang_kwargs["tp_size"] = self.world_size
-        if not (is_guard_model and self.num_gpus == 1):
-            assert self.num_gpus >= 2, f"Using {self.num_gpus} GPUs for SGLang, expected larger than 2."
-        else:
-            print("Guard reference model detected with tp_size=1; enabling single-GPU reference exemption.")
+        # if not (is_guard_model and self.num_gpus == 1):
+        #     assert self.num_gpus >= 2, f"Using {self.num_gpus} GPUs for SGLang, expected larger than 2."
+        # else:
+        #     print("Guard reference model detected with tp_size=1; enabling single-GPU reference exemption.")
         print(f"Using {self.num_gpus} GPUs for SGLang, with {self.world_size} for reference and 1 for quick.")
 
         # Initialize SGLang models
@@ -625,6 +625,8 @@ class DynamicSimpleSGLangSelector:
             next_token_ids: The next token ids from the quick model, shape (batch_size)
         """
         batch = scheduler.get_next_batch_to_run()
+        if batch is None:
+            return None, None, None, None
         result = scheduler.run_batch(batch)
 
         device = batch.seq_lens.device
@@ -723,6 +725,7 @@ class DynamicSimpleSGLangSelector:
 
         # Use uid to generate unique ids for each request
         rids = [str(uuid.uuid4()) for _ in range(batch_size)]
+        rid_to_original_index = {rid: i for i, rid in enumerate(rids)}
         for i, input_id in enumerate(batch_input_ids):
             req = Req(
                 rid=rids[i],
@@ -735,21 +738,20 @@ class DynamicSimpleSGLangSelector:
             )
             self.quick_scheduler.waiting_queue.append(req)
 
-        # Initialize token manager with tokenized inputs
+        # The token manager tracks all requested rows, while the scheduler may admit only
+        # a subset into a decode step. Per-step work below follows batch.reqs and maps
+        # each request back to its original row. The EOS set must also match the scheduler
+        # so finished rows are removed from both sides on the same token.
         token_manager = SGLangTokenManager(
-            batch_input_ids, self.tokenizer, max_new_tokens=max_new_tokens
+            batch_input_ids, self.tokenizer, max_new_tokens=max_new_tokens,
+            eos_token_ids=self.quick_scheduler.model_config.hf_eos_token_id,
         )
 
         # Generate tokens one by one until all prompts reach EOS or max limit
-        position = 0
-
         if not print_tokens:
             # Create tqdm progress bar for token generation
-            pbar = tqdm(total=max_new_tokens, desc="Dynamic SGLang: Generating tokens", leave=True)
-        while not token_manager.is_generation_complete() and position < max_new_tokens:
-            if not print_tokens:
-                pbar.update(1)
-
+            pbar = tqdm(total=batch_size * max_new_tokens, desc="Dynamic SGLang: Generated batch tokens", leave=True)
+        while not token_manager.is_generation_complete():
             active_count = token_manager.get_active_count()
 
             if active_count < 1:
@@ -757,6 +759,19 @@ class DynamicSimpleSGLangSelector:
 
             # Generate with quick model to get hidden states
             batch, hidden_states, logits, next_token_ids = self.decode_step(self.quick_scheduler, temperature=temperature, top_p=top_p, top_k=top_k)
+            if batch is None:
+                logger.warning(
+                    "Quick scheduler returned no runnable batch while token manager still has %s active sequence(s).",
+                    active_count,
+                )
+                break
+            batch_original_indices = [
+                rid_to_original_index[str(req.rid)]
+                for req in batch.reqs
+            ]
+            decode_count = len(batch_original_indices)
+            if decode_count < 1:
+                break
 
             # Create a ModelOutputs object for switching strategy
             model_outputs = ModelOutputs(
@@ -767,6 +782,10 @@ class DynamicSimpleSGLangSelector:
 
             # Use switching strategy to decide which model to use for each input
             model_choices = self.switching_strategy.route(model_outputs)
+            if model_choices.shape[0] != decode_count:
+                raise RuntimeError(
+                    f"Router returned {model_choices.shape[0]} choices for scheduler batch size {decode_count}"
+                )
 
             # Check if reference model is needed for any prompt
             reference_needed = torch.any(model_choices).item()
@@ -774,9 +793,8 @@ class DynamicSimpleSGLangSelector:
             if reference_needed:
                 # Get indices of inputs that need reference model as a list
                 reference_indices = torch.where(model_choices == 1)[0].tolist()
-                active_to_original = token_manager.get_active_index()
-                reference_original_indices = [active_to_original[i] for i in reference_indices]
-                reference_input_ids = token_manager.fetch_active_input_ids(reference_indices)
+                reference_original_indices = [batch_original_indices[i] for i in reference_indices]
+                reference_input_ids = token_manager.fetch_active_input_ids_by_original_index(reference_original_indices)
 
                 # Generate with reference model for inputs that need it
                 reference_outputs = self.extend_step(
@@ -790,7 +808,7 @@ class DynamicSimpleSGLangSelector:
                 # Combine outputs based on model choices
                 # Record if needed
                 if record_generation and recorders:
-                    for i in range(active_count):
+                    for i in range(decode_count):
                         if model_choices[i].item() == 1:  # Use reference model
                             # update next token ids
                             source_model = "reference"
@@ -803,14 +821,14 @@ class DynamicSimpleSGLangSelector:
                         token_str = self.tokenizer.decode(token)
 
                         # Add record
-                        active_indicies = token_manager.get_active_index()
-                        seq_idx = active_indicies[i]
+                        seq_idx = batch_original_indices[i]
+                        token_position = len(recorders[seq_idx].records)
                         recorders[seq_idx].add_record(
                             GenerationRecord(
                                 token_id=token,
                                 token_str=token_str,
                                 source_model=source_model,
-                                position=position,
+                                position=token_position,
                                 batch_id=seq_idx,
                                 param_size=param_size,
                             )
@@ -831,12 +849,13 @@ class DynamicSimpleSGLangSelector:
                 # Use quick model for all outputs
                 # Record if needed
                 if record_generation and recorders:
-                    for i in range(active_count):
+                    for i in range(decode_count):
                         token = next_token_ids[i].item()
                         token_str = self.tokenizer.decode(token)
 
                         # Find original batch index
-                        seq_idx = token_manager.get_active_index()[i]
+                        seq_idx = batch_original_indices[i]
+                        token_position = len(recorders[seq_idx].records)
 
                         # Add record
                         recorders[seq_idx].add_record(
@@ -844,7 +863,7 @@ class DynamicSimpleSGLangSelector:
                                 token_id=token,
                                 token_str=token_str,
                                 source_model="quick",
-                                position=position,
+                                position=token_position,
                                 batch_id=seq_idx,
                                 param_size=float(self.model_config["quick"]["param"]),
                             )
@@ -858,8 +877,20 @@ class DynamicSimpleSGLangSelector:
 
             # Update token manager with final outputs
             self.update_output_ids(batch, self.quick_scheduler, next_token_ids)
-            token_manager.update_sequences_direct([token_id.item() for token_id in next_token_ids])
-            position += 1
+            token_manager.update_sequences_by_original_index(
+                batch_original_indices,
+                [token_id.item() for token_id in next_token_ids],
+            )
+            if not print_tokens:
+                pbar.update(decode_count)
+                pbar.set_postfix(
+                    active=token_manager.get_active_count(),
+                    scheduled=decode_count,
+                    refresh=False,
+                )
+
+        if not print_tokens:
+            pbar.close()
 
         # Get final outputs from token manager
         final_results = token_manager.get_final_outputs()

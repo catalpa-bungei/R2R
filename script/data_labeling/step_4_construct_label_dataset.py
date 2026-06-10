@@ -183,7 +183,7 @@ def align_data(divergent_df, data_index_df):
     print("Aligning data...")
     # Keep label/correctness columns from verification df and adjust token_id.
     merge_columns = ['data_id', 'token_id', divergent_column_name]
-    for optional_column in ['small_correct', 'reference_correct']:
+    for optional_column in ['small_correct', 'reference_correct', 'small_safe', 'reference_safe']:
         if optional_column in divergent_df.columns and optional_column not in merge_columns:
             merge_columns.append(optional_column)
     divergent_df_updated = divergent_df[merge_columns].copy()
@@ -208,9 +208,12 @@ def align_data(divergent_df, data_index_df):
         # labels, missing candidates are unknown and should not be treated as wrong.
         fill_value = 0 if divergent_column_name == 'divergent' else -1
         merged_df[divergent_column_name] = merged_df[divergent_column_name].fillna(fill_value)
-        for optional_column in ['small_correct', 'reference_correct']:
+        for optional_column in ['small_correct', 'reference_correct', 'small_safe', 'reference_safe']:
             if optional_column in merged_df.columns:
-                merged_df[optional_column] = merged_df[optional_column].fillna(-1)
+                merged_df[optional_column] = pd.to_numeric(
+                    merged_df[optional_column],
+                    errors='coerce'
+                ).fillna(-1)
         merged_df['mismatch'] = merged_df['mismatch'].fillna(0)
         print(f"Data aligned. Tokens marked as {divergent_column_name}=1: {(merged_df[divergent_column_name] == 1).sum()}")
     else:
@@ -285,7 +288,7 @@ def create_dataset(batch_size=100000):
         'mismatch': Value('int64'),
         'mask': Value('int64'),
     }
-    for optional_column in ['small_correct', 'reference_correct']:
+    for optional_column in ['small_correct', 'reference_correct', 'small_safe', 'reference_safe']:
         if optional_column in aligned_df.columns and optional_column not in feature_dict:
             feature_dict[optional_column] = Value('int64')
     features = Features(feature_dict)
@@ -317,7 +320,7 @@ def create_dataset(batch_size=100000):
             'mismatch': aligned_df['mismatch'].iloc[start_idx:end_idx].tolist(),
             'mask': mask[start_idx:end_idx].tolist(),
         }
-        for optional_column in ['small_correct', 'reference_correct']:
+        for optional_column in ['small_correct', 'reference_correct', 'small_safe', 'reference_safe']:
             if optional_column in aligned_df.columns and optional_column not in batch_dict:
                 batch_dict[optional_column] = aligned_df[optional_column].iloc[start_idx:end_idx].tolist()
         
@@ -347,7 +350,7 @@ def create_dataset(batch_size=100000):
         'mismatch': aligned_df['mismatch'].tolist(),
         'mask': mask.tolist(),
     }
-    for optional_column in ['small_correct', 'reference_correct']:
+    for optional_column in ['small_correct', 'reference_correct', 'small_safe', 'reference_safe']:
         if optional_column in aligned_df.columns and optional_column not in dataset_dict:
             dataset_dict[optional_column] = aligned_df[optional_column].tolist()
     

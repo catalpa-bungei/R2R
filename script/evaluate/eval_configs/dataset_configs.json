@@ -33,7 +33,7 @@
         "prompt_template": "{question}",
         "description": "American Invitational Mathematics Examination problems with numerical answers"
     },
-    "gpqa": {
+    "gpqa-D": {
         "name": "GPQA Diamond Multiple Choice",
         "path": "/mnt/shared-storage-user/yangxuqing/GPQA/gpqa/gpqa_diamond.csv",
         "dataset_config": "gpqa_diamond",
@@ -154,6 +154,71 @@
         "prompt_template": "{question}",
         "description": "HarmBench standard training prompts; uses only the prompt field as the user prompt"
     },
+    "beavertails": {
+        "name": "BeaverTails",
+        "path": "/mnt/shared-storage-user/yangxuqing/BeaverTails/round0/30k/test.jsonl",
+        "dataset_config": "beavertails",
+        "split": "train",
+        "answer_type": "safe_generation",
+        "id_field": "id",
+        "question_field": "prompt",
+        "answer_field": "response",
+        "prompt_template": "{question}",
+        "metadata_fields": ["is_safe", "category"],
+        "description": "PKU-Alignment BeaverTails round0/30k test prompts; asks the model to answer the prompt directly"
+    },
+    "dnanswer": {
+        "name": "Do-not-answer",
+        "path": "/mnt/shared-storage-user/yangxuqing/Do-not-answer/data_en.csv",
+        "dataset_config": "dnanswer",
+        "split": "train",
+        "answer_type": "safe_generation",
+        "id_field": "id",
+        "question_field": "question",
+        "answer_field": "specific_harms",
+        "prompt_template": "{question}",
+        "metadata_fields": ["risk_area", "types_of_harm", "specific_harms"],
+        "description": "LibrAI Do-not-answer prompts; asks the model to answer the question directly"
+    },
+    "wildjailbreak": {
+        "name": "WildJailbreak",
+        "path": "/mnt/shared-storage-user/yangxuqing/WildJailbreak/WildJailbreak/eval/eval.tsv",
+        "dataset_config": "wildjailbreak",
+        "split": "train",
+        "answer_type": "safe_generation",
+        "id_field": "id",
+        "question_field": "adversarial",
+        "answer_field": "label",
+        "prompt_template": "{question}",
+        "metadata_fields": ["data_type"],
+        "description": "WildJailbreak eval TSV; asks the model to answer the adversarial prompt directly"
+    },
+    "healthbench_consensus": {
+        "name": "HealthBench Consensus",
+        "path": "/mnt/shared-storage-user/yangxuqing/HealthBench/consensus_2025-05-09-20-00-46.jsonl",
+        "dataset_config": "healthbench_consensus",
+        "split": "train",
+        "answer_type": "safe_generation",
+        "id_field": "prompt_id",
+        "question_field": "prompt",
+        "answer_field": "rubrics",
+        "prompt_template": "",
+        "metadata_fields": ["example_tags", "ideal_completions_data", "canary"],
+        "description": "OpenAI HealthBench consensus split; prompts are chat-message lists and rubrics are retained as evaluation metadata"
+    },
+    "librachem_text_test": {
+        "name": "LibraChem TEXT Test",
+        "path": "/mnt/shared-storage-user/yangxuqing/LibraChem/LibraChem/TEXT/exp/test/test_dataset.parquet",
+        "dataset_config": "librachem_text_test",
+        "split": "test",
+        "answer_type": "safe_generation",
+        "id_field": "batch_item_index",
+        "question_field": "prompt",
+        "answer_field": "chosen",
+        "prompt_template": "{question}",
+        "metadata_fields": ["rejected", "true_label"],
+        "description": "LibraChem TEXT exp test split; asks the model to answer the chemistry safety prompt directly"
+    },
     "wildguardtest": {
         "name": "wildguardtest",
         "path": "/mnt/shared-storage-user/yangxuqing/WildGuard/WildGuardTest/data/train-00000-of-00001.parquet",
@@ -165,5 +230,31 @@
         "answer_field": "label",
         "prompt_template": "",
         "description": "WildGuardTest dataset"
+    },
+    "falsereject": {
+        "name": "FalseReject",
+        "path": "/mnt/shared-storage-user/yangxuqing/FalseReject/FalseReject/test.jsonl",
+        "dataset_config": "falsereject",
+        "split": "test",
+        "answer_type": "safe_generation",
+        "id_field": "batch_item_index",
+        "question_field": "prompt",
+        "answer_field": "category_text",
+        "prompt_template": "{question}",
+        "metadata_fields": ["category"],
+        "description": "AmazonScience FalseReject test prompts; asks the model to answer the benign high-risk-looking prompt directly"
+    },
+    "xstest": {
+        "name": "XSTest",
+        "path": "/mnt/shared-storage-user/yangxuqing/XSTest/XSTest/data/train-00000-of-00001.parquet",
+        "dataset_config": "xstest",
+        "split": "test",
+        "answer_type": "safe_generation",
+        "id_field": "batch_item_index",
+        "question_field": "prompt",
+        "answer_field": "label",
+        "prompt_template": "{question}",
+        "metadata_fields": ["focus", "type", "note"],
+        "description": "XSTest exaggerated-safety prompts; asks the model to answer the prompt directly"
     }
 }

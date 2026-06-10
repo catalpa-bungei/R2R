@@ -279,7 +279,40 @@ The accuracy labels should be read as solution-usefulness labels:
 - `reference_correct = 1`: the reference continuation is locally valid and helps preserve or advance a path toward the final answer.
 - `reference_correct = 0`: the reference continuation is wrong, unsupported, contradictory, irrelevant, vacuous, or otherwise not useful for reaching the final answer.
 
-For safety-threshold routing, these two correctness signals are kept through Step 4 and combined during `train_router_safe.py` with two Qwen3Guard safety signals:
+### Accuracy + Safety Verification Variant
+
+For the `Qwen3-32B+Qwen3-4B-SafeRL` workflow, there is also a Step 3 variant that keeps the correctness judge and adds two explicit safety labels:
+
+- `script/data_labeling/step_3_verify_acc_safe.py`
+- `r2r/data/verify_model_acc_safe.py`
+
+This script first runs the same correctness verification as `step_3_verify_acc.py`, producing:
+
+- `small_correct`
+- `reference_correct`
+- `verify_response`
+
+It then runs `/mnt/shared-storage-user/yangxuqing/models/Qwen3Guard-Gen-8B` on each continuation branch, using the same prompt and parser style as `/mnt/shared-storage-user/yangxuqing/inference/safejudge_inference.py`, producing:
+
+- `small_safe`
+- `reference_safe`
+- `small_safejudge_label`
+- `reference_safejudge_label`
+- `small_safejudge_response`
+- `reference_safejudge_response`
+
+The Qwen3Guard-Gen answer extraction happens in `r2r/data/verify_model_acc_safe.py`:
+
+- `parse_safejudge_label(generated_text)` parses raw model text into `"<Safe>"`, `"<Unsafe>"`, or `"<Unknown>"`.
+- `safejudge_label_to_int(label)` converts `"<Safe>"` to `1`, `"<Unsafe>"` to `0`, and unknown outputs to `-1`.
+
+If Qwen3Guard-Gen outputs `Controversial` or `<Controversial>`, the parser treats it as unsafe and maps it to `small_safe = 0` or `reference_safe = 0`.
+
+By default, this script writes:
+
+- `generation_results_data_all_real_full_verify_acc_safe.csv`
+
+For safety-aware routing, these four Step 3 signals are kept through Step 4:
 
 - `general_token_safe`: whether the general/SLM token is safe according to Qwen3Guard.
 - `small_correct`: whether the general/SLM continuation is solution-useful and correct.
@@ -331,6 +364,10 @@ Final dataset columns:
 - `token_id`
 - `data_id`
 - `divergent`
+- `small_correct` when present in the Step 3 CSV
+- `reference_correct` when present in the Step 3 CSV
+- `small_safe` when present in the Step 3 CSV
+- `reference_safe` when present in the Step 3 CSV
 - `small_token`
 - `real_token`
 - `small_logits`
@@ -339,7 +376,7 @@ Final dataset columns:
 - `mismatch`
 - `mask`
 
-This stage aligns Step 3 verification labels back onto the full Step 1 token index. One implementation detail is that the verification CSV token id is adjusted by subtracting one before merging with the Step 1 index. Tokens that never appeared in the verification CSV are filled as `divergent = 0`, and `mismatch` marks the positions that came from mismatch candidates. The `mask` is derived from `token_type`; instruction tokens receive `mask = 0`, while reasoning/response tokens receive `mask = 1`.
+This stage aligns Step 3 verification labels back onto the full Step 1 token index. One implementation detail is that the verification CSV token id is adjusted by subtracting one before merging with the Step 1 index. Tokens that never appeared in the verification CSV are filled as `divergent = 0`; optional correctness and safety columns such as `small_correct`, `reference_correct`, `small_safe`, and `reference_safe` are filled as `-1` when missing. The `mismatch` column marks the positions that came from mismatch candidates. The `mask` is derived from `token_type`; instruction tokens receive `mask = 0`, while reasoning/response tokens receive `mask = 1`.
 
 At this point, the project has token-level labeled examples saying which positions should trigger escalation to the large model.
 
@@ -368,6 +405,27 @@ That config specifies:
 - optimization hyperparameters
 - threshold optimization target such as minimum recall
 - output checkpoint destinations
+
+Before training, check the epoch count in the selected training config:
+
+- `training.params.num_epochs`
+
+For example, `resource/default_training_config_qwen3-32B+qwen3-4B-SafeRL.json` may be set to `num_epochs = 1` for a quick run. In that case `script/train/train_router_safe_v2.py` will complete after exactly one epoch; this is not early stopping. Increase `num_epochs` before launching training if a longer run is intended.
+
+Also check available disk space before training, especially for `train_router_safe_v2.py`. Router checkpoints can be very large because `*_all.pt` files include copied source-model token embeddings and optimizer/checkpoint metadata. A v2 run can easily write hundreds of GB under:
+
+- `output/checkpoint_qwen3_32b_saferl_v2`
+- `resource/default_router_qwen3_32b_saferl_v2.pt`
+- `resource/default_router_qwen3_32b_saferl_v2_all.pt`
+
+Use a quick check such as:
+
+```bash
+df -h /mnt/shared-storage-user/yangxuqing
+du -sh output/checkpoint_qwen3_32b_saferl_v2 resource/default_router_qwen3_32b_saferl_v2*.pt 2>/dev/null
+```
+
+If the shared mount is full, PyTorch saves can fail with errors such as `PytorchStreamWriter failed writing file data/0: file write failed` or `unexpected pos ...`, and the run may leave tiny partial `.pt` files that should be removed before retrying.
 
 Typical outputs:
 
@@ -500,6 +558,65 @@ new_label = original_divergent OR guard_force_saferl
 
 By default this writes back into `divergent`, so unsafe or low-confidence-safe tokens are trained as positive routing examples. In the `Qwen3-32B+Qwen3-4B-SafeRL` setting, that means the router is trained to route those tokens to the SafeRL model even if the original divergence verifier did not mark them as divergent.
 
+## Safe Router Training V2 With Step 3 Safety Labels
+
+`script/train/train_router_safe_v2.py` is a variant for the `step_3_verify_acc_safe.py` pipeline. It keeps the same four-signal routing rule, but it does not derive `general_token_safe` and `safety_token_safe` by comparing Qwen3Guard-Stream probabilities to `safe_probability_threshold`.
+
+Instead, in `routing_logic = "four_signal"` mode:
+
+- `general_token_safe` is copied from the Step 4 dataset column `small_safe`.
+- `safety_token_safe` is copied from the Step 4 dataset column `reference_safe`.
+- `general_guard_safe_prob` is written as a compatibility score equal to `float(general_token_safe)`.
+- `safety_guard_safe_prob` is written as a compatibility score equal to `float(safety_token_safe)`.
+
+The default v2 safety config keys are:
+
+- `general_step3_safe_column`: `small_safe`
+- `safety_step3_safe_column`: `reference_safe`
+- `reuse_cached_four_signal`: `false`
+
+The `reuse_cached_four_signal` default prevents old Stream-threshold-derived four-signal columns from being silently reused when rerunning v2.
+
+For the `_v2` trial script, the active model prefix is:
+
+- `Qwen3-32B+Qwen3-4B-SafeRL-harmbench+gpqa-D_v2`
+
+Therefore `resource/default_training_config_qwen3-32B+qwen3-4B-SafeRL.json` must point both train and test dataset paths at:
+
+- `output/Qwen3-32B+Qwen3-4B-SafeRL-harmbench+gpqa-D_v2/LLM_response/SLM_prefill/LLM_continuation_verify/divergent_label_dataset`
+
+This path must be the Step 4 dataset produced from `generation_results_data_all_real_full_verify_acc_safe.csv`. If the config still points to the older non-`_v2` dataset, `train_router_safe_v2.py` will fail with missing Step 3 safety columns:
+
+- `small_safe`
+- `reference_safe`
+
+The v2 training config writes router artifacts to separate output folders so the original SafeRL router is not overwritten:
+
+- `resource/default_router_qwen3_32b_saferl_v2.pt`
+- `resource/default_router_qwen3_32b_saferl_v2_all.pt`
+- `output/checkpoint_qwen3_32b_saferl_v2`
+
+The final routing rule is still:
+
+```text
+route_to_safe = general_token_unsafe AND (general_wrong OR (safety_token_safe AND safety_model_correct))
+```
+
+The v2 implementation maps the columns as:
+
+- `general_token_unsafe`: `small_safe == 0`
+- `general_wrong`: `small_correct == 0`
+- `safety_token_safe`: `reference_safe == 1`
+- `safety_model_correct`: `reference_correct == 1`
+
+This gives the same routing table as above:
+
+- `small_safe = 1` -> route to the general model.
+- `small_safe = 0` and `small_correct = 0` -> route to the SafeRL model.
+- `small_safe = 0`, `small_correct = 1`, `reference_safe = 1`, and `reference_correct = 1` -> route to the SafeRL model.
+- `small_safe = 0`, `small_correct = 1`, and the reference branch is unsafe or incorrect -> route to the general model.
+- Any unknown safety/correctness signal (`-1`) produces `final_routing = -1`.
+
 ## How The Core Library Maps To The Pipeline
 
 The `r2r/` package holds the reusable internals behind the scripts:
@@ -543,6 +660,97 @@ The `trial.sh` examples show how the same benchmark can be run with different co
 - routed hybrid
 - pure small model
 - pure large/reference model
+
+### Adding A Dataset To R2R Evaluation
+
+Evaluation datasets are registered in:
+
+- `script/evaluate/eval_configs/dataset_configs.json`
+
+Each dataset entry tells `script/evaluate/hf_dataset_sglang_local.py` how to load rows, which column is the model prompt, which column is the reference answer or label, and which extra fields should be copied into intermediate CSV outputs.
+
+For a local safety-generation dataset such as Do-not-answer, add an entry shaped like:
+
+```json
+"dnanswer": {
+    "name": "Do-not-answer",
+    "path": "/mnt/shared-storage-user/yangxuqing/Do-not-answer/data_en.csv",
+    "dataset_config": "dnanswer",
+    "split": "train",
+    "answer_type": "safe_generation",
+    "id_field": "id",
+    "question_field": "question",
+    "answer_field": "specific_harms",
+    "prompt_template": "{question}",
+    "metadata_fields": ["risk_area", "types_of_harm", "specific_harms"],
+    "description": "LibrAI Do-not-answer prompts; asks the model to answer the question directly"
+}
+```
+
+Important fields:
+
+- `path`: Hugging Face dataset name or local file/directory path.
+- `question_field`: the column used as the user prompt.
+- `answer_field`: the column saved as `Answer`/ground-truth context.
+- `answer_type`: controls preprocessing and answer extraction.
+- `metadata_fields`: optional source columns copied into each processed item and temp CSV row.
+
+Use `answer_type: "safe_generation"` when the model should answer the user prompt directly and safety will be judged from the generated response. This branch does not wrap the prompt as a classifier task. In `hf_dataset_sglang_local.py`, it sets:
+
+```python
+processed_item["FormattedProblem"] = template.format(question=processed_item["Problem"])
+```
+
+So if `prompt_template` is `{question}`, the actual chat message content is exactly the source prompt. This is different from classifier-style evaluation, which would add an instruction such as “determine whether this prompt is harmful.”
+
+Local file loading is handled by `load_dataset_with_local_support(...)` in `hf_dataset_sglang_local.py`. It supports common local formats such as `.json`, `.jsonl`, `.csv`, `.tsv`, `.parquet`, and `.txt`; TSV files are loaded through the Hugging Face CSV loader with `delimiter="\t"`. If a new dataset uses a new extension, update this loader first.
+
+After adding the dataset config, add a command to the relevant trial script, for example:
+
+```bash
+python script/evaluate/hf_dataset_sglang_local.py \
+  --model_path $EVAL_MODEL_PATH \
+  --dataset dnanswer \
+  --config-path $EVAL_CONFIG_PATH --use_hybrid \
+  --tp_size $EVAL_TP_SIZE \
+  --enable_thinking false \
+  --batch_size 256
+```
+
+Use `--enable_thinking false` for direct-response safety-generation datasets when the goal is to benchmark the final answer quickly without long Qwen3 reasoning traces. Keep thinking enabled for reasoning benchmarks such as AIME.
+
+Validation checks after adding a dataset:
+
+```bash
+python -m json.tool script/evaluate/eval_configs/dataset_configs.json
+python -m py_compile script/evaluate/hf_dataset_sglang_local.py
+bash -n yxq_trial/trial_Qwen3-32B+Qwen3-4B-SafeRL.sh
+```
+
+### Thinking Mode During Evaluation
+
+`script/evaluate/hf_dataset_sglang_local.py` applies the Qwen3 chat template with `tokenizer.apply_chat_template(...)`. Qwen3's template defaults `enable_thinking` to `True` unless `enable_thinking=False` is passed explicitly, so by default every evaluated question produces a full `<think>...</think>` reasoning trace before its answer. The answer extractor splits on `</think>` to recover the final answer, confirming reasoning output is expected.
+
+Thinking mode is the main driver of per-question token cost. On reasoning-light multiple-choice benchmarks such as MMLU and GPQA, the 32B model can spend several thousand tokens per item on reasoning, which makes those evaluations slow.
+
+To control this, the script exposes an `--enable_thinking` flag that takes a boolean value (`true`/`false`, default `true`), matching the `--enable_thinking` convention used by `script/data_labeling/step_0_llm_response_thinking.py`:
+
+- `--enable_thinking true` (default): thinking stays on. This is correct for reasoning tasks like AIME, and is also where R2R's per-token routing between the `quick` (Qwen3-32B) and `reference` (Qwen3-4B-SafeRL) models does most of its work, since routing happens inside the reasoning trace.
+- `--enable_thinking false`: passes `enable_thinking=False` to the chat template, emitting an empty think block so the model answers directly. Use this for fast MMLU/GPQA runs. The R2R SGLang evaluator default `--max_new_tokens` is `4096`; explicit CLI values override this. For strict short-answer or classification-style runs, consider passing a smaller cap such as `2048`, `1024`, or less to avoid long runaway generations.
+
+Do not pass `--enable_thinking false` for AIME or other reasoning benchmarks: it both degrades accuracy and bypasses most of the hybrid routing mechanism. Note that the `enable_thinking: false` entry inside a config's `verify` block is a separate code path and does not affect main evaluation generation.
+
+### Batched Hybrid Generation And Scheduler Alignment
+
+The hybrid evaluation path supports batching multiple problems per generation call via `--batch_size` (default `1`). Larger batch sizes raise quick-model GPU utilization substantially, because R2R decodes the scheduler-admitted batch one token per step, and a single-sequence batch leaves the 32B quick model memory-bandwidth bound. Increasing `--batch_size` does not change routing decisions: in `DynamicSimpleSGLangSelector.generate`, the router is applied per row of the batch, so each problem is routed independently from its own hidden state. Only floating-point nondeterminism at the exact router threshold or a greedy argmax tie can differ across batch sizes, which is negligible.
+
+There are two invariants the batched path depends on. First, the `SGLangTokenManager` and the quick `Scheduler` must agree on when a sequence ends. The scheduler finishes a request when its token is in `model_config.hf_eos_token_id`, which for Qwen3 is a set containing both `<|im_end|>` (`151645`) and `<|endoftext|>` (`151643`). If the token manager only treated the tokenizer's single `eos_token_id` as terminal, a sequence ending on the alternate EOS would be dropped by the scheduler but kept by the token manager, so the routing loop could index past the decode tensors.
+
+Second, the decode loop must follow the scheduler's actual running batch, not the requested `--batch_size` or the token manager's full active count. SGLang may admit only a subset of requests into a step due to prompt length, token budget, or capacity. In that case tensors such as `model_choices` and `next_token_ids` are sized by `batch.reqs`, while unscheduled requests are still active in the token manager. `DynamicSimpleSGLangSelector.generate` therefore maps each scheduler `Req.rid` back to the original batch index and records, routes reference fallbacks, and updates token-manager sequences by those original indices. This prevents partial-admission failures such as `IndexError: index 30 is out of bounds for dimension 0 with size 30`.
+
+The inner tqdm bar is intentionally one aggregate bar per `generate(...)` batch, not one line per problem. Its total is `batch_size * max_new_tokens`, and each scheduler step advances by the number of rows actually decoded (`len(batch.reqs)`). The postfix reports the remaining token-manager active count and the number of rows scheduled in the current step, so partial scheduler admission is visible without flooding the terminal with one bar per row.
+
+To keep EOS handling in sync, `SGLangTokenManager` accepts an `eos_token_ids` argument and treats the full set as terminal, and `DynamicSimpleSGLangSelector.generate` passes `self.quick_scheduler.model_config.hf_eos_token_id` (the same EOS set used when constructing each quick `Req`). With this, both components finish a sequence on the same step. This is a correctness fix for any batched hybrid run, not only large batches: without it, a scheduler-finished sequence could also stall in the token manager and never complete.
 
 ## Important Configuration Files
 
